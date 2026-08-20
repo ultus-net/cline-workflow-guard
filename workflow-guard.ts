@@ -17,7 +17,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import type { AgentPlugin } from "@cline/sdk";
 
@@ -85,6 +85,129 @@ function findActiveTaskList(root: string): string | undefined {
 		}
 	}
 	return undefined;
+}
+
+// ── Task-completion commit gate ───────────────────────────────────────────────
+// Checking off a task ("- [ ]" -> "- [x]") requires a new commit since the
+// previous task was completed. This checkpoints each task's work into git so
+// history maps to the task list and crashed runs lose nothing.
+//
+// Escape hatch: append a "(no-commit: reason)" marker to the task line for
+// doc-only / verification tasks that need no commit.
+//
+// Scope: git repos on feature branches only. Non-git workspaces and task
+// edits on main/master (where commits are already blocked by the branch
+// guard) are unaffected.
+
+const TASK_STATE_FILE = ".cline/task-state.json";
+const NO_COMMIT_MARKER_RE = /\(no-commit(?::[^)]*)?\)/i;
+const CHECKED_TASK_RE = /^\s*[-*]\s+\[[xX]\]/gm;
+
+function gitHead(root: string): string | undefined {
+	const result = spawnSync("git", ["rev-parse", "HEAD"], {
+		cwd: root,
+		encoding: "utf8",
+		timeout: 10_000,
+	});
+	if (result.status !== 0) return undefined;
+	return result.stdout.trim() || undefined;
+}
+
+interface TaskState {
+	head?: string;
+}
+
+function readTaskState(root: string): TaskState {
+	try {
+		const parsed = JSON.parse(
+			readFileSync(resolve(root, TASK_STATE_FILE), "utf8"),
+		);
+		if (typeof parsed?.head === "string") return { head: parsed.head };
+	} catch {
+		// Missing/corrupt state — treat as no baseline yet.
+	}
+	return {};
+}
+
+function writeTaskState(root: string, state: TaskState): void {
+	try {
+		mkdirSync(resolve(root, ".cline"), { recursive: true });
+		writeFileSync(resolve(root, TASK_STATE_FILE), JSON.stringify(state));
+	} catch {
+		// Best effort — state tracking is an optimization baseline.
+	}
+}
+
+/** Simulate an edit-tool call on the task list; undefined when undecidable. */
+function simulateTaskListEdit(
+	content: string,
+	record: Record<string, unknown> | undefined,
+): string | undefined {
+	const oldText = typeof record?.old_text === "string" ? record.old_text : "";
+	const newText = typeof record?.new_text === "string" ? record.new_text : "";
+	if (oldText && content.includes(oldText)) {
+		return content.replace(oldText, newText);
+	}
+	if (!oldText && newText) {
+		// Insert/append or file creation — new lines only.
+		return content + "\n" + newText;
+	}
+	return undefined;
+}
+
+function countChecked(content: string): number {
+	return content.match(CHECKED_TASK_RE)?.length ?? 0;
+}
+
+/**
+ * Gate task check-offs on a new commit since the last completed task.
+ * Returns a skip result when the edit must be blocked, else undefined.
+ */
+function taskCheckoffGate(
+	root: string,
+	input: unknown,
+): { skip: true; reason: string } | undefined {
+	// Feature-branch git repos only.
+	const branch = currentGitBranch(root);
+	if (branch === undefined || branch === "" || PROTECTED_BRANCHES.has(branch)) {
+		return undefined;
+	}
+	const record = asRecord(input);
+	let content: string;
+	try {
+		content = readFileSync(resolve(root, "TASKS.md"), "utf8");
+	} catch {
+		return undefined; // Cannot read the list — other policies handle it.
+	}
+	const post = simulateTaskListEdit(content, record);
+	if (post === undefined || countChecked(post) <= countChecked(content)) {
+		return undefined; // Not a check-off edit.
+	}
+	// Allow lines that explicitly opt out (must carry a reason).
+	if (NO_COMMIT_MARKER_RE.test(post) && !NO_COMMIT_MARKER_RE.test(content)) {
+		const head = gitHead(root);
+		if (head) writeTaskState(root, { head });
+		return undefined;
+	}
+	const head = gitHead(root);
+	if (!head) return undefined; // No commits yet — nothing to compare.
+	const state = readTaskState(root);
+	if (state.head === undefined || state.head !== head) {
+		writeTaskState(root, { head });
+		return undefined; // New commit since last check-off — allowed.
+	}
+	console.error(
+		"[workflow-guard] blocked task check-off: no new commit since the last completed task",
+	);
+	return {
+		skip: true,
+		reason:
+			"Blocked: checking off a task requires a new commit since the " +
+			"previous task was completed (commit-per-task checkpointing). " +
+			"Commit the work first (`git add … && git commit -m …`), or — if " +
+			"the task needs no commit (docs-only, verification) — append " +
+			"\"(no-commit: reason)\" to the task line.",
+	};
 }
 
 // ── Branch guard ─────────────────────────────────────────────────────────────
@@ -331,7 +454,11 @@ const plugin: AgentPlugin = {
 				const isTaskListEdit = TASK_LIST_FILES.some((name) =>
 					resolve(workspaceRoot, target).endsWith(name),
 				);
-				if (!isTaskListEdit && onProtectedBranch(workspaceRoot)) {
+				if (isTaskListEdit) {
+				const gate = taskCheckoffGate(workspaceRoot, input);
+				if (gate) return gate;
+			}
+			if (!isTaskListEdit && onProtectedBranch(workspaceRoot)) {
 				console.error(
 					`[workflow-guard] blocked ${toolCall.toolName}: on protected branch ${currentGitBranch(workspaceRoot)}`,
 				);
