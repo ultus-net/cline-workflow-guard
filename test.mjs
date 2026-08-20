@@ -125,6 +125,30 @@ check("on feature branch: git commit allowed", !(await shell("git commit -m test
 rmSync(repo, { recursive: true, force: true });
 plugin.setup({}, { workspaceInfo: { rootPath: root } }); // restore
 
+console.log("— Policy 10: task-completion commit gate —");
+const repo2 = mkdtempSync(join(tmpdir(), "wg-taskgate-"));
+spawnSync("git", ["init", "-b", "main"], { cwd: repo2 });
+spawnSync("git", ["config", "user.email", "t@example.com"], { cwd: repo2 });
+spawnSync("git", ["config", "user.name", "Test"], { cwd: repo2 });
+writeFileSync(join(repo2, "TASKS.md"), "# Tasks\n- [ ] one\n- [ ] two\n- [ ] three\n");
+spawnSync("git", ["add", "."], { cwd: repo2 });
+spawnSync("git", ["commit", "-m", "init"], { cwd: repo2 });
+spawnSync("git", ["switch", "-c", "feat/x"], { cwd: repo2 });
+plugin.setup({}, { workspaceInfo: { rootPath: repo2 } });
+const editTask = (old_text, new_text) => call("editor", { path: join(repo2, "TASKS.md"), old_text, new_text });
+check("first check-off allowed (baseline commit)", !(await editTask("- [ ] one", "- [x] one")));
+check("second check-off blocked without new commit", blocked(await editTask("- [ ] two", "- [x] two")));
+check("check-off with (no-commit: reason) marker allowed", !(await editTask("- [ ] two", "- [x] two (no-commit: verification only)")));
+writeFileSync(join(repo2, "src.txt"), "change");
+spawnSync("git", ["add", "."], { cwd: repo2 });
+spawnSync("git", ["commit", "-m", "work"], { cwd: repo2 });
+check("check-off allowed after new commit", !(await editTask("- [ ] three", "- [x] three")));
+rmSync(repo2, { recursive: true, force: true });
+plugin.setup({}, { workspaceInfo: { rootPath: root } }); // restore
+// Non-git workspace: check-offs unaffected.
+writeFileSync(join(root, "TASKS.md"), "# Tasks\n- [ ] do thing\n");
+check("non-git workspace: check-off allowed", !(await call("editor", { path: join(root, "TASKS.md"), old_text: "- [ ] do thing", new_text: "- [x] do thing" })));
+
 console.log("— Input shapes —");
 check("single string command", blocked(await call("bash", "git push origin main")));
 check("legacy tool name run_commands", blocked(await call("run_commands", { commands: ["git push origin main"] })));

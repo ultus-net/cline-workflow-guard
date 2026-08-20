@@ -19,6 +19,7 @@ All policies run as `beforeTool` / `runStart` hooks that execute as code and ret
 | 7 | **Settings tamper guard** | Blocks the agent from modifying its own approval gates: `cline yolo`, `cline config`, and writes to Cline settings files. Approval settings can only be changed manually by the user in the UI. |
 | 8 | **Plan→Act gate** | Works together with Cline settings: keep `modeTransitions` / YOLO disabled so every Plan→Act switch requires user approval. `runStart` logs a reminder each run. |
 | 9 | **Feature-branch workflow** | When the workspace repo is on `main`/`master`, edit tools and history-changing git commands (`commit`, `merge`, `rebase`, `cherry-pick`, `revert`, `apply`, `am`, `reset`, `restore`, `stash pop`) are blocked with a prompt to create a feature branch first. Read-only commands, branch creation, non-git workspaces, and task-list file edits are unaffected. |
+| 10 | **Commit-per-task gate** | On feature branches, editing a task list to check off an item (`- [ ]` → `- [x]`) is blocked unless a new commit exists since the previous task was checked off (baseline tracked in `.cline/task-state.json`). Doc-only/verification tasks can opt out with a `(no-commit: reason)` marker on the task line. Non-git workspaces are unaffected. |
 
 ## Overrides ("unless otherwise specified")
 
