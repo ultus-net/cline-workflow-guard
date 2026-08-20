@@ -87,6 +87,49 @@ function findActiveTaskList(root: string): string | undefined {
 	return undefined;
 }
 
+// ── Branch guard ─────────────────────────────────────────────────────────────
+// All changes must be made on a feature branch, never directly on main/master.
+// The check applies inside git repos only; non-git workspaces are unaffected.
+
+const PROTECTED_BRANCHES = new Set(["main", "master"]);
+const GIT_WRITE_RE =
+	/\bgit\s+(commit|merge|rebase|cherry-pick|revert|stash\s+pop|apply|am|restore|reset)\b/;
+
+function currentGitBranch(root: string): string | undefined {
+	const result = spawnSync("git", ["branch", "--show-current"], {
+		cwd: root,
+		encoding: "utf8",
+		timeout: 10_000,
+	});
+	if (result.status === 0 && result.stdout.trim()) {
+		return result.stdout.trim();
+	}
+	// Fallback for unborn branches / odd runtimes: read .git/HEAD directly.
+	try {
+		const head = readFileSync(resolve(root, ".git", "HEAD"), "utf8").trim();
+		const match = head.match(/^ref:\s+refs\/heads\/(\S+)/);
+		if (match) return match[1];
+	} catch {
+		// Not a repo (or worktree without .git dir) — no gate.
+	}
+	if (result.status === 0) return ""; // detached HEAD — treat as unprotected
+	return undefined;
+}
+
+function onProtectedBranch(root: string): boolean {
+	const branch = currentGitBranch(root);
+	return branch !== undefined && PROTECTED_BRANCHES.has(branch);
+}
+
+function branchGuardReason(): string {
+	return (
+		"Blocked: the workspace is on a protected branch (main/master). " +
+		"Create a feature branch first — e.g. " +
+		"`git switch -c feat/description` — and make all changes there, " +
+		"then open a PR. Direct changes on main/master are not allowed."
+	);
+}
+
 // ── Live-system guard ────────────────────────────────────────────────────────
 
 const ALLOW_LIVE_MARKER = /#\s*allow-live\b/;
@@ -167,18 +210,28 @@ function mcpMutationTool(toolName: string): string | undefined {
 // The model must not be able to flip its own approval gates (e.g. enable YOLO
 // mode or auto-approve "act" mode transitions) by editing settings files.
 
+// Tamper patterns are evaluated per command segment (split on newlines, |, ;,
+// &) so that tokens appearing on unrelated lines of a multi-line command can't
+// combine into a false match. Segments are built in isSettingsTamper below.
 const SETTINGS_TAMPER_PATTERNS: RegExp[] = [
-	// Direct writes to Cline data/settings or globalStorage
-	/\b(cline|saoudrizwan)\b[^|;&]*\b(settings|config|state)\b[^|;&]*\.(json|db|yaml)/i,
-	// CLI/TUI config edit commands
-	/\bcline\s+(config|settings|auto-approve|yolo)\b/i,
-	// Generic yolo/auto-approve toggles
-	/\byolo\b/i,
-	/\bauto[-_ ]approve\b/i,
+	// Direct writes to Cline data/settings or globalStorage — the words must
+	// appear within a single path-like token, not merely anywhere in a segment.
+	/[\w\/.-]*(?:cline|saoudrizwan)[\w\/.-]*\b(?:settings|auto-approve|config|state)\b[\w\/.-]*\.(?:json|db|yaml)\b/i,
+	// The well-known Cline settings file by name.
+	/[\w\/.-]*\bauto-approve\.json\b/i,
+	// CLI/TUI config edit commands — matched as command verbs, not bare words.
+	/\bcline\s+(?:config|settings|auto-approve|yolo)\b/i,
+	/\byolo\s+(?:mode|on|enable|true)\b/i,
 ];
 
 function isSettingsTamper(command: string): boolean {
-	return SETTINGS_TAMPER_PATTERNS.some((re) => re.test(command));
+	// Evaluate each segment independently so regexes cannot span lines or
+	// shell separators (a bare "\n" between "cline" and "settings" used to
+	// combine into a false positive).
+	const segments = command.split(/[\n|;&]+/);
+	return segments.some((segment) =>
+		SETTINGS_TAMPER_PATTERNS.some((re) => re.test(segment)),
+	);
 }
 
 function branchHasChangelogChange(root: string): boolean {
@@ -278,7 +331,13 @@ const plugin: AgentPlugin = {
 				const isTaskListEdit = TASK_LIST_FILES.some((name) =>
 					resolve(workspaceRoot, target).endsWith(name),
 				);
-				if (!isTaskListEdit && !findActiveTaskList(workspaceRoot)) {
+				if (!isTaskListEdit && onProtectedBranch(workspaceRoot)) {
+				console.error(
+					`[workflow-guard] blocked ${toolCall.toolName}: on protected branch ${currentGitBranch(workspaceRoot)}`,
+				);
+				return { skip: true, reason: branchGuardReason() };
+			}
+			if (!isTaskListEdit && !findActiveTaskList(workspaceRoot)) {
 					console.error(
 						`[workflow-guard] blocked ${toolCall.toolName}: no active task list`,
 					);
@@ -324,6 +383,15 @@ const plugin: AgentPlugin = {
 			const commands = extractCommands(input);
 			for (const raw of commands) {
 				const command = normalize(raw);
+
+				// ── Policy 8: changes only on feature branches ───────────
+				// Block git history-changing commands while on main/master.
+				if (GIT_WRITE_RE.test(command) && onProtectedBranch(workspaceRoot)) {
+					console.error(
+						`[workflow-guard] blocked git write on protected branch: ${command.slice(0, 120)}`,
+					);
+					return { skip: true, reason: branchGuardReason() };
+				}
 
 				// ── Policy 6: block self-modification of approval gates ──
 				if (isSettingsTamper(command)) {
