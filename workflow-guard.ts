@@ -257,9 +257,16 @@ function branchGuardReason(): string {
 
 const ALLOW_LIVE_MARKER = /#\s*allow-live\b/;
 
+// Force push: --force / --force-with-lease / -f anywhere before the first
+// separator in a `git push` command.
+const FORCE_PUSH_RE =
+	/\bgit\s+push\b[^|;&]*(--force\b|--force-with-lease\b|\s-f\b)/;
+
 interface LivePattern {
 	re: RegExp;
 	what: string;
+	/** When true the pattern is skipped on feature branches (git force pushes). */
+	allowedOnFeatureBranch?: boolean;
 }
 
 const LIVE_MUTATION_PATTERNS: LivePattern[] = [
@@ -280,13 +287,24 @@ const LIVE_MUTATION_PATTERNS: LivePattern[] = [
 	{ re: /\b(psql|mysql|mariadb|mongosh|mongo|redis-cli|sqlite3)\b[^|;&]*\b(drop|delete|truncate|flushall|flushdb)\b/i, what: "destructive database command" },
 	// Destructive remote HTTP calls (DELETE only; POST/PUT/PATCH are normal API work)
 	{ re: /\bcurl\b(?=[^|;&]*(?:(?<!\S)(?:-X|--request)\s*=?\s*DELETE))(?=[^|;&]*https?:\/\/(?!localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]))/, what: "remote HTTP DELETE" },
-	// Destructive git operations
-	{ re: /\bgit\s+push\b[^|;&]*(--force\b|--force-with-lease\b|\s-f\b)/, what: "force push" },
+	// Destructive git operations: force pushes are only destructive on
+	// protected branches — rebasing/rewriting your own feature branch is
+	// normal workflow. Pushes to main/master are blocked by Policy 2
+	// regardless, and force pushes on main/master additionally match here.
+	{
+		re: FORCE_PUSH_RE,
+		what: "force push",
+		allowedOnFeatureBranch: true,
+	},
 ];
 
-function liveMutationIn(command: string): string | undefined {
-	for (const { re, what } of LIVE_MUTATION_PATTERNS) {
+function liveMutationIn(
+	command: string,
+	onFeatureBranch: boolean,
+): string | undefined {
+	for (const { re, what, allowedOnFeatureBranch } of LIVE_MUTATION_PATTERNS) {
 		if (re.test(command)) {
+			if (allowedOnFeatureBranch && onFeatureBranch) continue;
 			return what;
 		}
 	}
@@ -536,7 +554,17 @@ const plugin: AgentPlugin = {
 
 				// ── Policy 4: live-system mutations need explicit opt-in ──
 				if (!allowLive && !ALLOW_LIVE_MARKER.test(command)) {
-					const what = liveMutationIn(command);
+					const what = liveMutationIn(
+					command,
+					(() => {
+						const branch = currentGitBranch(workspaceRoot);
+						return (
+							branch !== undefined &&
+							branch !== "" &&
+							!PROTECTED_BRANCHES.has(branch)
+						);
+					})(),
+				);
 					if (what) {
 						console.error(
 							`[workflow-guard] blocked ${what}: ${command.slice(0, 120)}`,

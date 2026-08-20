@@ -122,6 +122,9 @@ check("on main: task-list file edit still exempt", !(await call("editor", { path
 spawnSync("git", ["switch", "-c", "feat/x"], { cwd: repo });
 check("on feature branch: editor allowed", !(await call("editor", { path: join(repo, "a.ts"), new_text: "x" })));
 check("on feature branch: git commit allowed", !(await shell("git commit -m test")));
+check("on feature branch: force push allowed", !(await shell("git push --force origin feat/x")));
+check("on feature branch: force-with-lease allowed", !(await shell("git push --force-with-lease origin feat/x")));
+check("on feature branch: force push to main still blocked", blocked(await shell("git push --force origin main")));
 rmSync(repo, { recursive: true, force: true });
 plugin.setup({}, { workspaceInfo: { rootPath: root } }); // restore
 
