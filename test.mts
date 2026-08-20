@@ -9,19 +9,19 @@ const plugin = mod.default ?? mod.plugin;
 const beforeTool = plugin.hooks.beforeTool;
 
 let pass = 0, fail = 0;
-const check = (name, cond) => { cond ? (pass++, console.log("  ok  " + name)) : (fail++, console.log("FAIL  " + name)); };
+const check = (name: string, cond: boolean): void => { cond ? (pass++, console.log("  ok  " + name)) : (fail++, console.log("FAIL  " + name)); };
 
 const root = mkdtempSync(join(tmpdir(), "wg-test-"));
 const prevLive = process.env.WORKFLOW_GUARD_ALLOW_LIVE;
 delete process.env.WORKFLOW_GUARD_ALLOW_LIVE;
 plugin.setup({}, { workspaceInfo: { rootPath: root } });
 
-const call = async (toolName, input) => {
+const call = async (toolName: string, input: unknown) => {
   const r = await beforeTool({ toolCall: { toolName }, input });
   return r?.skip ? r : undefined;
 };
-const shell = (cmd) => call("bash", { commands: [cmd] });
-const blocked = (r) => !!r?.skip;
+const shell = (cmd: string) => call("bash", { commands: [cmd] });
+const blocked = (r: unknown): boolean => !!(r as { skip?: boolean } | undefined)?.skip;
 
 await plugin.hooks.runStart({});
 check("runStart runs without error", true);
@@ -135,7 +135,7 @@ spawnSync("git", ["add", "."], { cwd: repo2 });
 spawnSync("git", ["commit", "-m", "init"], { cwd: repo2 });
 spawnSync("git", ["switch", "-c", "feat/x"], { cwd: repo2 });
 plugin.setup({}, { workspaceInfo: { rootPath: repo2 } });
-const editTask = (old_text, new_text) => call("editor", { path: join(repo2, "TASKS.md"), old_text, new_text });
+const editTask = (old_text: string, new_text: string) => call("editor", { path: join(repo2, "TASKS.md"), old_text, new_text });
 check("first check-off allowed (baseline commit)", !(await editTask("- [ ] one", "- [x] one")));
 check("second check-off blocked without new commit", blocked(await editTask("- [ ] two", "- [x] two")));
 check("check-off with (no-commit: reason) marker allowed", !(await editTask("- [ ] two", "- [x] two (no-commit: verification only)")));
