@@ -1,4 +1,5 @@
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -100,6 +101,29 @@ check("FIXED: bare 'echo yolo' allowed", !(await shell("echo yolo")));
 check("FIXED: mention of auto-approve in prose allowed", !(await shell("echo 'the auto-approve feature is documented here'")));
 check("still blocks real tamper on same line", blocked(await shell(`echo '{}' > /var/home/x/.cline/data/settings/auto-approve.json`)));
 check("allow normal command", !(await shell("ls -la && git status")));
+
+console.log("— Policy 8: branch guard —");
+// Non-git workspace (current `root` is a plain temp dir): git writes allowed.
+check("non-git workspace: git commit allowed", !(await shell("git commit -m test")));
+check("non-git workspace: editor allowed", !(await call("editor", { path: join(root, "a.ts"), new_text: "x" })));
+// Real git repo on main.
+const repo = mkdtempSync(join(tmpdir(), "wg-repo-"));
+spawnSync("git", ["init", "-b", "main"], { cwd: repo });
+writeFileSync(join(root, "TASKS.md"), "# Tasks\n- [ ] do thing\n");
+// Point the plugin's workspaceRoot at the repo.
+plugin.setup({}, { workspaceInfo: { rootPath: repo } });
+writeFileSync(join(repo, "TASKS.md"), "# Tasks\n- [ ] do thing\n");
+check("on main: editor blocked", blocked(await call("editor", { path: join(repo, "a.ts"), new_text: "x" })));
+check("on main: git commit blocked", blocked(await shell("git commit -m test")));
+check("on main: git merge blocked", blocked(await shell("git merge feature/x")));
+check("on main: git switch -c allowed (branch creation)", !(await shell("git switch -c feat/x")));
+check("on main: git status allowed", !(await shell("git status")));
+check("on main: task-list file edit still exempt", !(await call("editor", { path: join(repo, "TASKS.md"), new_text: "x" })));
+spawnSync("git", ["switch", "-c", "feat/x"], { cwd: repo });
+check("on feature branch: editor allowed", !(await call("editor", { path: join(repo, "a.ts"), new_text: "x" })));
+check("on feature branch: git commit allowed", !(await shell("git commit -m test")));
+rmSync(repo, { recursive: true, force: true });
+plugin.setup({}, { workspaceInfo: { rootPath: root } }); // restore
 
 console.log("— Input shapes —");
 check("single string command", blocked(await call("bash", "git push origin main")));

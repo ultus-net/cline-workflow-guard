@@ -87,6 +87,49 @@ function findActiveTaskList(root: string): string | undefined {
 	return undefined;
 }
 
+// ── Branch guard ─────────────────────────────────────────────────────────────
+// All changes must be made on a feature branch, never directly on main/master.
+// The check applies inside git repos only; non-git workspaces are unaffected.
+
+const PROTECTED_BRANCHES = new Set(["main", "master"]);
+const GIT_WRITE_RE =
+	/\bgit\s+(commit|merge|rebase|cherry-pick|revert|stash\s+pop|apply|am|restore|reset)\b/;
+
+function currentGitBranch(root: string): string | undefined {
+	const result = spawnSync("git", ["branch", "--show-current"], {
+		cwd: root,
+		encoding: "utf8",
+		timeout: 10_000,
+	});
+	if (result.status === 0 && result.stdout.trim()) {
+		return result.stdout.trim();
+	}
+	// Fallback for unborn branches / odd runtimes: read .git/HEAD directly.
+	try {
+		const head = readFileSync(resolve(root, ".git", "HEAD"), "utf8").trim();
+		const match = head.match(/^ref:\s+refs\/heads\/(\S+)/);
+		if (match) return match[1];
+	} catch {
+		// Not a repo (or worktree without .git dir) — no gate.
+	}
+	if (result.status === 0) return ""; // detached HEAD — treat as unprotected
+	return undefined;
+}
+
+function onProtectedBranch(root: string): boolean {
+	const branch = currentGitBranch(root);
+	return branch !== undefined && PROTECTED_BRANCHES.has(branch);
+}
+
+function branchGuardReason(): string {
+	return (
+		"Blocked: the workspace is on a protected branch (main/master). " +
+		"Create a feature branch first — e.g. " +
+		"`git switch -c feat/description` — and make all changes there, " +
+		"then open a PR. Direct changes on main/master are not allowed."
+	);
+}
+
 // ── Live-system guard ────────────────────────────────────────────────────────
 
 const ALLOW_LIVE_MARKER = /#\s*allow-live\b/;
@@ -288,7 +331,13 @@ const plugin: AgentPlugin = {
 				const isTaskListEdit = TASK_LIST_FILES.some((name) =>
 					resolve(workspaceRoot, target).endsWith(name),
 				);
-				if (!isTaskListEdit && !findActiveTaskList(workspaceRoot)) {
+				if (!isTaskListEdit && onProtectedBranch(workspaceRoot)) {
+				console.error(
+					`[workflow-guard] blocked ${toolCall.toolName}: on protected branch ${currentGitBranch(workspaceRoot)}`,
+				);
+				return { skip: true, reason: branchGuardReason() };
+			}
+			if (!isTaskListEdit && !findActiveTaskList(workspaceRoot)) {
 					console.error(
 						`[workflow-guard] blocked ${toolCall.toolName}: no active task list`,
 					);
@@ -334,6 +383,15 @@ const plugin: AgentPlugin = {
 			const commands = extractCommands(input);
 			for (const raw of commands) {
 				const command = normalize(raw);
+
+				// ── Policy 8: changes only on feature branches ───────────
+				// Block git history-changing commands while on main/master.
+				if (GIT_WRITE_RE.test(command) && onProtectedBranch(workspaceRoot)) {
+					console.error(
+						`[workflow-guard] blocked git write on protected branch: ${command.slice(0, 120)}`,
+					);
+					return { skip: true, reason: branchGuardReason() };
+				}
 
 				// ── Policy 6: block self-modification of approval gates ──
 				if (isSettingsTamper(command)) {
