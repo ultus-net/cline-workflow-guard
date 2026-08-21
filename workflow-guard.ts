@@ -130,15 +130,82 @@ const CHECKED_TASK_RE = /^\s*[-*]\s+\[[xX]\]/gm;
 const TASK_LINE_RE = /^\s*[-*]\s+\[[ xX]\]/;
 const CHANGELOG_FILE = "CHANGELOG.md";
 
+// ── Task labels ────────────────────────────────────────────────────────────
+// Every task line carries a mandatory label — "(auth)", "(api-v2)" — that
+// links it to its parent TODO item and to its CHANGELOG entry. Labels are
+// the identity spine of the workflow: matching is by label, never by prose,
+// so wording changes cannot launder a missing task.
+//
+//   TODO.md      - [ ] (auth) Add login flow
+//   TASKS.md     - [ ] (auth) Build login form      ← child of (auth)
+//   CHANGELOG.md - (auth) Add login flow            ← recorded on cleanup
+
+// Labels: lowercase letter followed by lowercase letters/digits/hyphens.
+const LABEL_RE = /\(([a-z](?:[a-z0-9-]*[a-z0-9])?)\)/;
+function taskLabel(line: string): string | undefined {
+	// Skip the (no-commit: …) marker — it is metadata, not identity.
+	const m = line
+		.replace(NO_COMMIT_MARKER_RE, "")
+		.match(LABEL_RE);
+	return m?.[1];
+}
+
+const UNLABELED_TASK_REASON =
+	"Blocked: every task line must carry a label linking it to its parent " +
+	"TODO item — e.g. '- [ ] (auth) Add login form'. Add a '(label)' to each " +
+	"task so it can be traced TODO.md → TASKS.md → CHANGELOG.md.";
+
 /**
- * True when a changelog entry exists for `task` under a section that comes
- * before any versioned release heading (i.e. the "Unreleased" bucket, whether
- * or not the heading is spelled that way). Older release sections are not
- * re-scanned, so new work must produce new entries.
+ * Validate full task-list content (used for shell-based rewrites that bypass
+ * edit-tool input analysis). Returns a block result when any task line lacks
+ * a label. Best-effort: heredoc bodies are extracted only for simple
+ * single-command writes.
  */
-function changelogHasUnreleasedEntry(content: string, task: string): boolean {
+function validateTaskListContent(content: string): string | undefined {
+	const lines = content
+		.split("\n")
+		.filter((l) => TASK_LINE_RE.test(l) && !NO_COMMIT_MARKER_RE.test(l));
+	const unlabeled = lines.filter((l) => taskLabel(l) === undefined);
+	if (unlabeled.length === 0) return undefined;
+	return UNLABELED_TASK_REASON;
+}
+
+/**
+ * Extract the body of a simple heredoc write to a task-list file, e.g.
+ *   cat <<'EOF' > TASKS.md\n…body…\nEOF
+ * Returns undefined for anything else (pipes, appends, non-task targets) —
+ * those are left to the edit-tool gates.
+ */
+function taskListShellWrite(
+	command: string,
+): { body: string } | undefined {
+	const m = command.match(
+		/<<\s*['"]?(\w+)['"]?\s*>\s*(\S+)\s*\n([\s\S]*)\n\1\s*$/,
+	);
+	if (!m) return undefined;
+	const target = m[2] ?? "";
+	const isTaskList = TASK_LIST_FILES.some(
+		(name) => target === name || target.endsWith(`/${name}`),
+	);
+	if (!isTaskList) return undefined;
+	return { body: m[3] ?? "" };
+}
+
+/**
+ * True when a changelog entry for `label` exists under the Unreleased bucket
+ * (any heading containing "unreleased", before any versioned/other heading).
+ * Older release sections are never re-scanned, so new work must produce new
+ * entries.
+ */
+function changelogHasUnreleasedLabel(
+	content: string,
+	label: string,
+): boolean {
 	let inUnreleased = false;
 	let foundHeading = false;
+	const labelToken = new RegExp(
+		`\\(${label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\)`,
+	);
 	for (const line of content.split("\n")) {
 		const heading = line.match(/^#{1,6}\s+(.*)$/);
 		if (heading) {
@@ -149,13 +216,11 @@ function changelogHasUnreleasedEntry(content: string, task: string): boolean {
 				continue;
 			}
 			if (/\d+\.\d+/.test(title) || (foundHeading && inUnreleased)) {
-				// Versioned release (or any heading after Unreleased) — the
-				// unreleased bucket is over.
-				inUnreleased = false;
+				inUnreleased = false; // A later heading closes the bucket.
 			}
 			continue;
 		}
-		if (inUnreleased && line.includes(task)) {
+		if (inUnreleased && labelToken.test(line)) {
 			return true;
 		}
 	}
@@ -361,9 +426,20 @@ function taskCheckoffGate(
 	const info = analyzeTaskEdit(content, input);
 	if (!info) return undefined; // Edit does not touch task lines.
 
+	// ── Labels are mandatory — the TODO → task → changelog link ──
+	const unlabeled = [...info.addedTasks, ...info.flipped].filter(
+		(l) => taskLabel(l) === undefined,
+	);
+	if (unlabeled.length > 0) {
+		console.error(
+			`[workflow-guard] blocked unlabeled task line: ${unlabeled[0]?.slice(0, 80)}`,
+		);
+		return { skip: true, reason: UNLABELED_TASK_REASON };
+	}
+
 	// ── Final cleanup: all tasks done → remove the list, log the work ──
-	// The completed tasks may only be removed from the list once CHANGELOG.md
-	// records them under Unreleased — otherwise tasks silently vanish.
+	// Completed tasks may only be removed once CHANGELOG.md records their
+	// label under Unreleased — otherwise tasks silently vanish.
 	if (!UNCHECKED_LINE_RE.test(content)) {
 		const removedChecked = info.removedTasks.filter((l) =>
 			CHECKED_LINE_RE.test(l),
@@ -382,25 +458,30 @@ function taskCheckoffGate(
 					reason:
 						`Blocked: all tasks are complete. Before removing them from ` +
 						`${taskFile}, create ${CHANGELOG_FILE} with an '## Unreleased' ` +
-						"section listing what was done (one bullet per task).",
+						"section listing what was done — one bullet per label, e.g. " +
+						"'- (auth) Add login flow'.",
 				};
 			}
-			const missing = removedChecked.filter(
-				(l) => !changelogHasUnreleasedEntry(changelog, taskText(l)),
-			);
-			if (missing.length > 0) {
+			const missingLabels = [
+				...new Set(
+					removedChecked
+						.map(taskLabel)
+						.filter((l): l is string => l !== undefined),
+				),
+			].filter((label) => !changelogHasUnreleasedLabel(changelog, label));
+			if (missingLabels.length > 0) {
 				console.error(
-					`[workflow-guard] blocked task cleanup: no changelog entry for "${taskText(missing[0] ?? "").slice(0, 80)}"`,
+					`[workflow-guard] blocked task cleanup: no changelog entry for (${missingLabels[0]})`,
 				);
 				return {
 					skip: true,
 					reason:
 						"Blocked: completed tasks may only be removed from the list " +
-						`once they are recorded in ${CHANGELOG_FILE} under an ` +
-						`'## Unreleased' section. Missing entry for: ` +
-						missing.map((l) => `"${taskText(l).slice(0, 60)}"`).join(", ") +
-						". Add the changelog entries first (this edit is exempt from " +
-						"the commit-per-task gate), then remove the tasks.",
+						`once their labels are recorded in ${CHANGELOG_FILE} under an ` +
+						"'## Unreleased' section. Missing entries for: " +
+						missingLabels.map((l) => `(${l})`).join(", ") +
+						". Add the changelog entries first (changelog edits are exempt " +
+						"from the commit-per-task gate), then remove the tasks.",
 				};
 			}
 			// Legitimate cleanup — reset the baseline for the next request.
@@ -450,7 +531,12 @@ function taskCheckoffGate(
 	const firstUnchecked = content.split("\n").find((l) => UNCHECKED_LINE_RE.test(l));
 	if (firstUnchecked) {
 		const expected = taskText(firstUnchecked);
-		const skipped = info.flipped.filter((l) => taskText(l) !== expected);
+		const expectedLabel = taskLabel(firstUnchecked);
+		const skipped = info.flipped.filter(
+			(l) =>
+				taskLabel(l) !== expectedLabel &&
+				(expectedLabel === undefined || taskText(l) !== expected),
+		);
 		const firstSkipped = skipped[0];
 		if (firstSkipped !== undefined) {
 			console.error(
@@ -929,8 +1015,10 @@ const plugin: AgentPlugin = {
 						reason:
 							"Blocked: no active task list found. First create " +
 							"TASKS.md (or TODO.md / PLAN.md / .cline/plan.md) in the " +
-							"workspace root with the request broken down as '- [ ]' " +
-							"checkbox items, then work through them top to bottom.",
+							"workspace root with the request broken down as '- [ ] (label) " +
+							"description' checkbox items — one label per task, linking " +
+							"each to its TODO item and changelog entry — then work " +
+							"through them top to bottom.",
 					};
 				}
 				return undefined;
@@ -966,6 +1054,23 @@ const plugin: AgentPlugin = {
 			const commands = extractCommands(input);
 			for (const raw of commands) {
 				const command = normalize(raw);
+
+				// ── Policies 10–12: shell rewrites of task lists ──────
+				// Edit tools validate task lines from the tool input; shell
+				// writes (cat <<EOF > TASKS.md) bypass that, so validate the
+				// heredoc body directly. Best-effort: simple single-command
+				// heredoc writes only — anything fancier is the edit tools'
+				// job (they are the sanctioned path).
+				const taskWrite = taskListShellWrite(raw);
+				if (taskWrite) {
+					const bad = validateTaskListContent(taskWrite.body);
+					if (bad) {
+						console.error(
+							`[workflow-guard] blocked shell task-list write: unlabeled task lines`,
+						);
+						return { skip: true, reason: bad };
+					}
+				}
 
 				// ── Policy 8: changes only on feature branches ───────────
 				// Block git history-changing commands while on main/master.

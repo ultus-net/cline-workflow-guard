@@ -141,7 +141,7 @@ const repo2 = mkdtempSync(join(tmpdir(), "wg-taskgate-"));
 spawnSync("git", ["init", "-b", "main"], { cwd: repo2 });
 spawnSync("git", ["config", "user.email", "t@example.com"], { cwd: repo2 });
 spawnSync("git", ["config", "user.name", "Test"], { cwd: repo2 });
-writeFileSync(join(repo2, "TASKS.md"), "# Tasks\n- [ ] one\n- [ ] two\n- [ ] three\n");
+writeFileSync(join(repo2, "TASKS.md"), "# Tasks\n- [ ] (one) first task\n- [ ] (two) second task\n- [ ] (three) third task\n");
 spawnSync("git", ["add", "."], { cwd: repo2 });
 spawnSync("git", ["commit", "-m", "init"], { cwd: repo2 });
 spawnSync("git", ["switch", "-c", "feat/x"], { cwd: repo2 });
@@ -149,57 +149,77 @@ plugin.setup({}, { workspaceInfo: { rootPath: repo2 } });
 const editTask = (old_text: string, new_text: string) => call("editor", { path: join(repo2, "TASKS.md"), old_text, new_text });
 const patchTask = (from: string, to: string) => call("apply_patch", { input: `*** Begin Patch\n*** Update File: TASKS.md\n@@\n-${from}\n+${to}\n*** End Patch` });
 const setTasks = (c: string) => writeFileSync(join(repo2, "TASKS.md"), c);
-check("first check-off allowed (baseline commit)", !(await editTask("- [ ] one", "- [x] one")));
-setTasks("# Tasks\n- [x] one\n- [ ] two\n- [ ] three\n");
-check("second check-off blocked without new commit", blocked(await editTask("- [ ] two", "- [x] two")));
-check("out-of-order check-off blocked (three before two)", blocked(await editTask("- [ ] three", "- [x] three")));
-check("apply_patch check-off blocked without new commit", blocked(await patchTask("- [ ] two", "- [x] two")));
-check("apply_patch check-off with (no-commit) marker allowed", !(await patchTask("- [ ] two", "- [x] two (no-commit: verification only)")));
-check("check-off with (no-commit: reason) marker allowed", !(await editTask("- [ ] two", "- [x] two (no-commit: verification only)")));
-setTasks("# Tasks\n- [x] one\n- [x] two (no-commit: verification only)\n- [ ] three\n");
+check("unlabeled task line blocked", blocked(await editTask("- [ ] (one) first task", "- [x] no-label rewrite\n- [x] (one) first task")));
+check("first check-off allowed (baseline commit)", !(await editTask("- [ ] (one) first task", "- [x] (one) first task")));
+setTasks("# Tasks\n- [x] (one) first task\n- [ ] (two) second task\n- [ ] (three) third task\n");
+check("second check-off blocked without new commit", blocked(await editTask("- [ ] (two) second task", "- [x] (two) second task")));
+check("out-of-order check-off blocked (three before two)", blocked(await editTask("- [ ] (three) third task", "- [x] (three) third task")));
+check("apply_patch check-off blocked without new commit", blocked(await patchTask("- [ ] (two) second task", "- [x] (two) second task")));
+check("apply_patch check-off with (no-commit) marker allowed", !(await patchTask("- [ ] (two) second task", "- [x] (two) second task (no-commit: verification only)")));
+check("check-off with (no-commit: reason) marker allowed", !(await editTask("- [ ] (two) second task", "- [x] (two) second task (no-commit: verification only)")));
+setTasks("# Tasks\n- [x] (one) first task\n- [x] (two) second task (no-commit: verification only)\n- [ ] (three) third task\n");
 // A commit that only touches the task list / plugin state must not count as work.
 spawnSync("git", ["add", "."], { cwd: repo2 });
 spawnSync("git", ["commit", "-m", "tasks only"], { cwd: repo2 });
-check("task-list-only commit does not satisfy gate", blocked(await editTask("- [ ] three", "- [x] three")));
+check("task-list-only commit does not satisfy gate", blocked(await editTask("- [ ] (three) third task", "- [x] (three) third task")));
 writeFileSync(join(repo2, "src.txt"), "change");
 spawnSync("git", ["add", "."], { cwd: repo2 });
 spawnSync("git", ["commit", "-m", "work"], { cwd: repo2 });
-check("check-off allowed after new work commit", !(await editTask("- [ ] three", "- [x] three")));
+check("check-off allowed after new work commit", !(await editTask("- [ ] (three) third task", "- [x] (three) third task")));
 
 console.log("— Policy 12: task lifecycle (cleanup + changelog) —");
 // repo2 list is now: all three tasks checked (one was checked off via patch).
-setTasks("# Tasks\n- [x] one\n- [x] two (no-commit: verification only)\n- [x] three\n");
+setTasks("# Tasks\n- [x] (one) first task\n- [x] (two) second task (no-commit: verification only)\n- [x] (three) third task\n");
 // Mid-flight removal protection is moot here (all checked); test cleanup gate:
-check("cleanup blocked without CHANGELOG.md", blocked(await editTask("- [x] one\n", "")));
-writeFileSync(join(repo2, "CHANGELOG.md"), "# Changelog\n\n## 1.0.0\n- old release entry for one\n");
-check("cleanup blocked when entry only exists under an old release", blocked(await editTask("- [x] one\n", "")));
+check("cleanup blocked without CHANGELOG.md", blocked(await editTask("- [x] (one) first task\n", "")));
+writeFileSync(join(repo2, "CHANGELOG.md"), "# Changelog\n\n## 1.0.0\n- (one) old release entry\n");
+check("cleanup blocked when entry only exists under an old release", blocked(await editTask("- [x] (one) first task\n", "")));
 check("changelog edit without Unreleased heading blocked in cleanup phase", blocked(await call("editor", { path: join(repo2, "CHANGELOG.md"), old_text: "# Changelog", new_text: "# Changelog\nmore" })));
-check("changelog edit adding Unreleased section allowed", !(await call("editor", { path: join(repo2, "CHANGELOG.md"), old_text: "# Changelog\n", new_text: "# Changelog\n\n## Unreleased\n- one\n- two\n- three\n" })));
-writeFileSync(join(repo2, "CHANGELOG.md"), "# Changelog\n\n## Unreleased\n- one\n- two\n- three\n\n## 1.0.0\n- old release\n");
-check("cleanup allowed once all tasks are in Unreleased", !(await editTask("# Tasks\n- [x] one\n- [x] two (no-commit: verification only)\n- [x] three\n", "# Tasks\n")));
-// Partial cleanup: 'three' not yet logged → still blocked.
-setTasks("# Tasks\n- [x] one\n- [x] three\n");
-writeFileSync(join(repo2, "CHANGELOG.md"), "# Changelog\n\n## Unreleased\n- one\n");
-check("partial cleanup blocked for unlogged task", blocked(await editTask("- [x] three\n", "")));
-check("partial cleanup allowed for logged task", !(await editTask("- [x] one\n", "")));
+check("changelog edit adding Unreleased section allowed", !(await call("editor", { path: join(repo2, "CHANGELOG.md"), old_text: "# Changelog\n", new_text: "# Changelog\n\n## Unreleased\n- (one) Add first task\n- (two) Add second task\n- (three) Add third task\n" })));
+writeFileSync(join(repo2, "CHANGELOG.md"), "# Changelog\n\n## Unreleased\n- (one) Add first task\n- (two) Add second task\n- (three) Add third task\n\n## 1.0.0\n- old release\n");
+check("cleanup allowed once all labels are in Unreleased", !(await editTask("# Tasks\n- [x] (one) first task\n- [x] (two) second task (no-commit: verification only)\n- [x] (three) third task\n", "# Tasks\n")));
+// Partial cleanup: (three) not yet logged → still blocked, even with
+// completely different changelog wording (label match, not prose match).
+setTasks("# Tasks\n- [x] (one) first task\n- [x] (three) third task\n");
+writeFileSync(join(repo2, "CHANGELOG.md"), "# Changelog\n\n## Unreleased\n- (one) Totally reworded description of the first task\n");
+check("partial cleanup blocked for unlogged label", blocked(await editTask("- [x] (three) third task\n", "")));
+check("reworded changelog entry accepted via label match", !(await editTask("- [x] (one) first task\n", "")));
 // Fresh cycle: new unchecked tasks added to an empty list are fine.
 setTasks("# Tasks\n");
-check("adding fresh tasks after cleanup allowed", !(await editTask("# Tasks\n", "# Tasks\n- [ ] next thing\n")));
+check("adding fresh labeled tasks after cleanup allowed", !(await editTask("# Tasks\n", "# Tasks\n- [ ] (next) next thing\n")));
 // Mid-flight removal protection (unchecked task deleted).
-setTasks("# Tasks\n- [ ] alpha\n- [ ] beta\n");
+setTasks("# Tasks\n- [ ] (alpha) alpha task\n- [ ] (beta) beta task\n");
 writeFileSync(join(repo2, "src2.txt"), "w");
 spawnSync("git", ["add", "."], { cwd: repo2 });
 spawnSync("git", ["commit", "-m", "w2"], { cwd: repo2 });
-check("mid-flight deletion of unchecked task blocked", blocked(await editTask("- [ ] beta\n", "")));
-check("mid-flight rewording of unchecked task blocked", blocked(await editTask("- [ ] beta", "- [ ] beta reworded")));
-check("mid-flight removal of (no-commit) checked line allowed", !(await editTask("- [ ] alpha", "- [x] alpha (no-commit: docs)")));
-setTasks("# Tasks\n- [x] alpha (no-commit: docs)\n- [ ] beta\n");
-check("obsolete marked checked line removal allowed", !(await editTask("- [x] alpha (no-commit: docs)\n", "")));
+check("mid-flight deletion of unchecked task blocked", blocked(await editTask("- [ ] (beta) beta task\n", "")));
+check("mid-flight rewording of unchecked task blocked", blocked(await editTask("- [ ] (beta) beta task", "- [ ] (beta) beta reworded")));
+check("mid-flight removal of (no-commit) checked line allowed", !(await editTask("- [ ] (alpha) alpha task", "- [x] (alpha) alpha task (no-commit: docs)")));
+setTasks("# Tasks\n- [x] (alpha) alpha task (no-commit: docs)\n- [ ] (beta) beta task\n");
+check("obsolete marked checked line removal allowed", !(await editTask("- [x] (alpha) alpha task (no-commit: docs)\n", "")));
 rmSync(repo2, { recursive: true, force: true });
 plugin.setup({}, { workspaceInfo: { rootPath: root } }); // restore
 // Non-git workspace: check-offs unaffected.
 writeFileSync(join(root, "TASKS.md"), "# Tasks\n- [ ] do thing\n");
 check("non-git workspace: check-off allowed", !(await call("editor", { path: join(root, "TASKS.md"), old_text: "- [ ] do thing", new_text: "- [x] do thing" })));
+
+console.log("— Labels: shell rewrites of task lists —");
+{
+  const repo3 = mkdtempSync(join(tmpdir(), "wg-shellwrite-"));
+  spawnSync("git", ["init", "-b", "main"], { cwd: repo3 });
+  spawnSync("git", ["config", "user.email", "t@example.com"], { cwd: repo3 });
+  spawnSync("git", ["config", "user.name", "Test"], { cwd: repo3 });
+  writeFileSync(join(repo3, "TASKS.md"), "# Tasks\n- [ ] (x) x\n");
+  spawnSync("git", ["add", "."], { cwd: repo3 });
+  spawnSync("git", ["commit", "-m", "init"], { cwd: repo3 });
+  spawnSync("git", ["switch", "-c", "feat/y"], { cwd: repo3 });
+  plugin.setup({}, { workspaceInfo: { rootPath: repo3 } });
+  check("heredoc rewrite with unlabeled tasks blocked", blocked(await shell("cat <<'EOF' > TASKS.md\n# Tasks\n- [ ] no label here\nEOF")));
+  check("heredoc rewrite with labeled tasks allowed", !(await shell("cat <<'EOF' > TASKS.md\n# Tasks\n- [ ] (x) relabeled fine\nEOF")));
+  check("heredoc to non-task file ignored", !(await shell("cat <<'EOF' > NOTES.md\n- [ ] no label needed here\nEOF")));
+  rmSync(repo3, { recursive: true, force: true });
+  plugin.setup({}, { workspaceInfo: { rootPath: root } }); // restore
+}
 
 console.log("— Input shapes —");
 check("single string command", blocked(await call("bash", "git push origin main")));
