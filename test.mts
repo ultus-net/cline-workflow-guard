@@ -23,8 +23,8 @@ const call = async (toolName: string, input: unknown) => {
 const shell = (cmd: string) => call("bash", { commands: [cmd] });
 const blocked = (r: unknown): boolean => !!(r as { skip?: boolean } | undefined)?.skip;
 
-await plugin.hooks.runStart({});
-check("runStart runs without error", true);
+await plugin.hooks.beforeRun({});
+check("beforeRun runs without error", true);
 
 console.log("— Policy 1: task-list gate —");
 writeFileSync(join(root, "TASKS.md"), "# Tasks\n- [ ] do thing\n- [x] done\n");
@@ -43,6 +43,10 @@ check("block git push origin master", blocked(await shell("git push origin maste
 check("block git push --force origin main", blocked(await shell("git push --force origin main")));
 check("allow git push origin feature/x", !(await shell("git push origin feature/x")));
 check("allow push to main-backup (ref-like path)", !(await shell("git push origin main-backup")));
+check("block refspec push HEAD:main", blocked(await shell("git push origin HEAD:main")));
+check("block refspec push HEAD:master", blocked(await shell("git push origin HEAD:master")));
+check("block branch deletion push :main", blocked(await shell("git push origin :main")));
+check("allow refspec push HEAD:feat/x", !(await shell("git push origin HEAD:feat/x")));
 
 console.log("— Policy 3: PR changelog —");
 check("block gh pr create without changelog", blocked(await shell("gh pr create --title t --body 'no changes here'")));
@@ -94,6 +98,8 @@ check("block cline config set autoApprove", blocked(await shell("cline config se
 check("block cline settings", blocked(await shell("cline settings set readFiles true")));
 check("block echo yolo mode", blocked(await shell("enable yolo mode now")));
 check("block writing auto-approve.json", blocked(await shell(`echo '{}' > ${root}/settings/auto-approve.json`)));
+check("block editor write to auto-approve.json (edit-tool path)", blocked(await call("editor", { path: "/var/home/x/.cline/data/settings/auto-approve.json", new_text: "{}" })));
+check("block apply_patch on auto-approve.json (edit-tool path)", blocked(await call("apply_patch", { input: "*** Begin Patch\n*** Update File: /var/home/x/.cline/data/settings/auto-approve.json\n@@\n+{}\n*** End Patch" })));
 check("block writing ~/.cline/settings/vscode-cline.json", blocked(await shell(`echo '{}' > /var/home/x/.cline/settings/vscode-cline.json`)));
 check("block saoudrizwan state.db write", blocked(await shell(`rm /var/home/x/.config/Code/User/globalStorage/saoudrizwan.claude-dev/settings/state.db`)));
 check("FIXED: multiline cmd w/ plugin dir + 'settings' + '.json' allowed", !(await shell("cd /var/home/csh/cline-workflow-guard\nls -la\ncat package.json\n# note about settings files\n# e.g. foo.json")));
@@ -119,6 +125,8 @@ check("on main: git merge blocked", blocked(await shell("git merge feature/x")))
 check("on main: git switch -c allowed (branch creation)", !(await shell("git switch -c feat/x")));
 check("on main: git status allowed", !(await shell("git status")));
 check("on main: task-list file edit still exempt", !(await call("editor", { path: join(repo, "TASKS.md"), new_text: "x" })));
+check("on main: apply_patch to task list still exempt", !(await call("apply_patch", { input: "*** Begin Patch\n*** Update File: TASKS.md\n@@\n+note\n*** End Patch" })));
+check("on main: docs/TASKS.md NOT exempt (exact match only)", blocked(await call("editor", { path: join(repo, "docs", "TASKS.md"), new_text: "x" })));
 spawnSync("git", ["switch", "-c", "feat/x"], { cwd: repo });
 check("on feature branch: editor allowed", !(await call("editor", { path: join(repo, "a.ts"), new_text: "x" })));
 check("on feature branch: git commit allowed", !(await shell("git commit -m test")));
@@ -133,24 +141,124 @@ const repo2 = mkdtempSync(join(tmpdir(), "wg-taskgate-"));
 spawnSync("git", ["init", "-b", "main"], { cwd: repo2 });
 spawnSync("git", ["config", "user.email", "t@example.com"], { cwd: repo2 });
 spawnSync("git", ["config", "user.name", "Test"], { cwd: repo2 });
-writeFileSync(join(repo2, "TASKS.md"), "# Tasks\n- [ ] one\n- [ ] two\n- [ ] three\n");
+writeFileSync(join(repo2, "TASKS.md"), "# Tasks\n- [ ] (one) first task\n- [ ] (two) second task\n- [ ] (three) third task\n");
 spawnSync("git", ["add", "."], { cwd: repo2 });
 spawnSync("git", ["commit", "-m", "init"], { cwd: repo2 });
 spawnSync("git", ["switch", "-c", "feat/x"], { cwd: repo2 });
 plugin.setup({}, { workspaceInfo: { rootPath: repo2 } });
 const editTask = (old_text: string, new_text: string) => call("editor", { path: join(repo2, "TASKS.md"), old_text, new_text });
-check("first check-off allowed (baseline commit)", !(await editTask("- [ ] one", "- [x] one")));
-check("second check-off blocked without new commit", blocked(await editTask("- [ ] two", "- [x] two")));
-check("check-off with (no-commit: reason) marker allowed", !(await editTask("- [ ] two", "- [x] two (no-commit: verification only)")));
+const patchTask = (from: string, to: string) => call("apply_patch", { input: `*** Begin Patch\n*** Update File: TASKS.md\n@@\n-${from}\n+${to}\n*** End Patch` });
+const setTasks = (c: string) => writeFileSync(join(repo2, "TASKS.md"), c);
+check("unlabeled task line blocked", blocked(await editTask("- [ ] (one) first task", "- [x] no-label rewrite\n- [x] (one) first task")));
+check("first check-off allowed (baseline commit)", !(await editTask("- [ ] (one) first task", "- [x] (one) first task")));
+setTasks("# Tasks\n- [x] (one) first task\n- [ ] (two) second task\n- [ ] (three) third task\n");
+check("second check-off blocked without new commit", blocked(await editTask("- [ ] (two) second task", "- [x] (two) second task")));
+check("out-of-order check-off blocked (three before two)", blocked(await editTask("- [ ] (three) third task", "- [x] (three) third task")));
+check("apply_patch check-off blocked without new commit", blocked(await patchTask("- [ ] (two) second task", "- [x] (two) second task")));
+check("apply_patch check-off with (no-commit) marker allowed", !(await patchTask("- [ ] (two) second task", "- [x] (two) second task (no-commit: verification only)")));
+check("check-off with (no-commit: reason) marker allowed", !(await editTask("- [ ] (two) second task", "- [x] (two) second task (no-commit: verification only)")));
+setTasks("# Tasks\n- [x] (one) first task\n- [x] (two) second task (no-commit: verification only)\n- [ ] (three) third task\n");
+// A commit that only touches the task list / plugin state must not count as work.
+spawnSync("git", ["add", "."], { cwd: repo2 });
+spawnSync("git", ["commit", "-m", "tasks only"], { cwd: repo2 });
+check("task-list-only commit does not satisfy gate", blocked(await editTask("- [ ] (three) third task", "- [x] (three) third task")));
 writeFileSync(join(repo2, "src.txt"), "change");
 spawnSync("git", ["add", "."], { cwd: repo2 });
 spawnSync("git", ["commit", "-m", "work"], { cwd: repo2 });
-check("check-off allowed after new commit", !(await editTask("- [ ] three", "- [x] three")));
+check("check-off allowed after new work commit", !(await editTask("- [ ] (three) third task", "- [x] (three) third task")));
+
+console.log("— Policy 12: task lifecycle (cleanup + changelog) —");
+// repo2 list is now: all three tasks checked (one was checked off via patch).
+setTasks("# Tasks\n- [x] (one) first task\n- [x] (two) second task (no-commit: verification only)\n- [x] (three) third task\n");
+// Mid-flight removal protection is moot here (all checked); test cleanup gate:
+check("cleanup blocked without CHANGELOG.md", blocked(await editTask("- [x] (one) first task\n", "")));
+writeFileSync(join(repo2, "CHANGELOG.md"), "# Changelog\n\n## 1.0.0\n- (one) old release entry\n");
+check("cleanup blocked when entry only exists under an old release", blocked(await editTask("- [x] (one) first task\n", "")));
+check("changelog edit without Unreleased heading blocked in cleanup phase", blocked(await call("editor", { path: join(repo2, "CHANGELOG.md"), old_text: "# Changelog", new_text: "# Changelog\nmore" })));
+check("changelog edit adding Unreleased section allowed", !(await call("editor", { path: join(repo2, "CHANGELOG.md"), old_text: "# Changelog\n", new_text: "# Changelog\n\n## Unreleased\n- (one) Add first task\n- (two) Add second task\n- (three) Add third task\n" })));
+writeFileSync(join(repo2, "CHANGELOG.md"), "# Changelog\n\n## Unreleased\n- (one) Add first task\n- (two) Add second task\n- (three) Add third task\n\n## 1.0.0\n- old release\n");
+check("cleanup allowed once all labels are in Unreleased", !(await editTask("# Tasks\n- [x] (one) first task\n- [x] (two) second task (no-commit: verification only)\n- [x] (three) third task\n", "# Tasks\n")));
+// Partial cleanup: (three) not yet logged → still blocked, even with
+// completely different changelog wording (label match, not prose match).
+setTasks("# Tasks\n- [x] (one) first task\n- [x] (three) third task\n");
+writeFileSync(join(repo2, "CHANGELOG.md"), "# Changelog\n\n## Unreleased\n- (one) Totally reworded description of the first task\n");
+check("partial cleanup blocked for unlogged label", blocked(await editTask("- [x] (three) third task\n", "")));
+check("reworded changelog entry accepted via label match", !(await editTask("- [x] (one) first task\n", "")));
+// Fresh cycle: new unchecked tasks added to an empty list are fine.
+setTasks("# Tasks\n");
+check("adding fresh labeled tasks after cleanup allowed", !(await editTask("# Tasks\n", "# Tasks\n- [ ] (next) next thing\n")));
+// Mid-flight removal protection (unchecked task deleted).
+setTasks("# Tasks\n- [ ] (alpha) alpha task\n- [ ] (beta) beta task\n");
+writeFileSync(join(repo2, "src2.txt"), "w");
+spawnSync("git", ["add", "."], { cwd: repo2 });
+spawnSync("git", ["commit", "-m", "w2"], { cwd: repo2 });
+check("mid-flight deletion of unchecked task blocked", blocked(await editTask("- [ ] (beta) beta task\n", "")));
+check("mid-flight rewording of unchecked task blocked", blocked(await editTask("- [ ] (beta) beta task", "- [ ] (beta) beta reworded")));
+check("mid-flight removal of (no-commit) checked line allowed", !(await editTask("- [ ] (alpha) alpha task", "- [x] (alpha) alpha task (no-commit: docs)")));
+setTasks("# Tasks\n- [x] (alpha) alpha task (no-commit: docs)\n- [ ] (beta) beta task\n");
+check("obsolete marked checked line removal allowed", !(await editTask("- [x] (alpha) alpha task (no-commit: docs)\n", "")));
 rmSync(repo2, { recursive: true, force: true });
 plugin.setup({}, { workspaceInfo: { rootPath: root } }); // restore
 // Non-git workspace: check-offs unaffected.
 writeFileSync(join(root, "TASKS.md"), "# Tasks\n- [ ] do thing\n");
 check("non-git workspace: check-off allowed", !(await call("editor", { path: join(root, "TASKS.md"), old_text: "- [ ] do thing", new_text: "- [x] do thing" })));
+
+console.log("— Policy 14: TODO ↔ TASKS correspondence —");
+{
+  const repo4 = mkdtempSync(join(tmpdir(), "wg-corr-"));
+  spawnSync("git", ["init", "-b", "main"], { cwd: repo4 });
+  spawnSync("git", ["config", "user.email", "t@example.com"], { cwd: repo4 });
+  spawnSync("git", ["config", "user.name", "Test"], { cwd: repo4 });
+  writeFileSync(join(repo4, "TODO.md"), "# Todo\n- [ ] (auth) Add login flow\n");
+  writeFileSync(join(repo4, "TASKS.md"), "# Tasks\n- [ ] (auth) Build login form\n");
+  spawnSync("git", ["add", "."], { cwd: repo4 });
+  spawnSync("git", ["commit", "-m", "init"], { cwd: repo4 });
+  spawnSync("git", ["switch", "-c", "feat/z"], { cwd: repo4 });
+  plugin.setup({}, { workspaceInfo: { rootPath: repo4 } });
+  const editTodo = (old_text: string, new_text: string) => call("editor", { path: join(repo4, "TODO.md"), old_text, new_text });
+  const editTasks = (old_text: string, new_text: string) => call("editor", { path: join(repo4, "TASKS.md"), old_text, new_text });
+  // Orphan: adding a TASKS item whose label is not in TODO.
+  check("orphan task without TODO parent blocked", blocked(await editTasks("- [ ] (auth) Build login form", "- [ ] (auth) Build login form\n- [ ] (billing) Add invoices")));
+  // Un-started: adding a TODO item with no TASKS breakdown.
+  check("un-started TODO item blocked", blocked(await editTodo("- [ ] (auth) Add login flow", "- [ ] (auth) Add login flow\n- [ ] (billing) Add invoices")));
+  // Checking off a TODO item is allowed even though TASKS still has the label
+  // (checked TODO items are exempt — they're heading for cleanup).
+  check("checking off TODO parent allowed", !(await editTodo("- [ ] (auth) Add login flow", "- [x] (auth) Add login flow")));
+  // The TODO check-off consumed the baseline; commit real work before the
+  // task check-off (Policy 10: commit-per-task).
+  writeFileSync(join(repo4, "login-form.ts"), "export {};\n");
+  spawnSync("git", ["add", "."], { cwd: repo4 });
+  spawnSync("git", ["commit", "-m", "build login form"], { cwd: repo4 });
+  // Working a task whose TODO parent exists: fine.
+  check("task check-off with matching parent allowed", !(await editTasks("- [ ] (auth) Build login form", "- [x] (auth) Build login form")));
+  // Single-file workflow: no TODO.md → correspondence skipped.
+  rmSync(join(repo4, "TODO.md"));
+  writeFileSync(join(repo4, "TASKS.md"), "# Tasks\n- [ ] (solo) lone file task\n");
+  writeFileSync(join(repo4, "solo.ts"), "export {};\n");
+  spawnSync("git", ["add", "."], { cwd: repo4 });
+  spawnSync("git", ["commit", "-m", "solo work"], { cwd: repo4 });
+  check("single-file workflow skips correspondence", !(await editTasks("- [ ] (solo) lone file task", "- [x] (solo) lone file task")));
+  rmSync(repo4, { recursive: true, force: true });
+  plugin.setup({}, { workspaceInfo: { rootPath: root } }); // restore
+}
+
+console.log("— Labels: shell rewrites of task lists —");
+{
+  const repo3 = mkdtempSync(join(tmpdir(), "wg-shellwrite-"));
+  spawnSync("git", ["init", "-b", "main"], { cwd: repo3 });
+  spawnSync("git", ["config", "user.email", "t@example.com"], { cwd: repo3 });
+  spawnSync("git", ["config", "user.name", "Test"], { cwd: repo3 });
+  writeFileSync(join(repo3, "TASKS.md"), "# Tasks\n- [ ] (x) x\n");
+  spawnSync("git", ["add", "."], { cwd: repo3 });
+  spawnSync("git", ["commit", "-m", "init"], { cwd: repo3 });
+  spawnSync("git", ["switch", "-c", "feat/y"], { cwd: repo3 });
+  plugin.setup({}, { workspaceInfo: { rootPath: repo3 } });
+  check("heredoc rewrite with unlabeled tasks blocked", blocked(await shell("cat <<'EOF' > TASKS.md\n# Tasks\n- [ ] no label here\nEOF")));
+  check("heredoc rewrite with labeled tasks allowed", !(await shell("cat <<'EOF' > TASKS.md\n# Tasks\n- [ ] (x) relabeled fine\nEOF")));
+  check("heredoc to non-task file ignored", !(await shell("cat <<'EOF' > NOTES.md\n- [ ] no label needed here\nEOF")));
+  rmSync(repo3, { recursive: true, force: true });
+  plugin.setup({}, { workspaceInfo: { rootPath: root } }); // restore
+}
 
 console.log("— Input shapes —");
 check("single string command", blocked(await call("bash", "git push origin main")));

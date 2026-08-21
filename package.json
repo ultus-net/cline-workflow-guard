@@ -1,6 +1,6 @@
 {
   "name": "cline-workflow-guard",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Cline plugin enforcing workflow discipline through deterministic beforeTool hooks",
   "license": "MIT",
   "type": "module",
@@ -23,6 +23,11 @@
     "@cline/sdk": {
       "optional": true
     }
+  },
+  "devDependencies": {
+    "@cline/sdk": "*",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
   },
   "scripts": {
     "test": "node --experimental-strip-types test.mts",
