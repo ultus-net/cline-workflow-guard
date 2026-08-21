@@ -167,18 +167,28 @@ function mcpMutationTool(toolName: string): string | undefined {
 // The model must not be able to flip its own approval gates (e.g. enable YOLO
 // mode or auto-approve "act" mode transitions) by editing settings files.
 
+// Tamper patterns are evaluated per command segment (split on newlines, |, ;,
+// &) so that tokens appearing on unrelated lines of a multi-line command can't
+// combine into a false match. Segments are built in isSettingsTamper below.
 const SETTINGS_TAMPER_PATTERNS: RegExp[] = [
-	// Direct writes to Cline data/settings or globalStorage
-	/\b(cline|saoudrizwan)\b[^|;&]*\b(settings|config|state)\b[^|;&]*\.(json|db|yaml)/i,
-	// CLI/TUI config edit commands
-	/\bcline\s+(config|settings|auto-approve|yolo)\b/i,
-	// Generic yolo/auto-approve toggles
-	/\byolo\b/i,
-	/\bauto[-_ ]approve\b/i,
+	// Direct writes to Cline data/settings or globalStorage — the words must
+	// appear within a single path-like token, not merely anywhere in a segment.
+	/[\w\/.-]*(?:cline|saoudrizwan)[\w\/.-]*\b(?:settings|auto-approve|config|state)\b[\w\/.-]*\.(?:json|db|yaml)\b/i,
+	// The well-known Cline settings file by name.
+	/[\w\/.-]*\bauto-approve\.json\b/i,
+	// CLI/TUI config edit commands — matched as command verbs, not bare words.
+	/\bcline\s+(?:config|settings|auto-approve|yolo)\b/i,
+	/\byolo\s+(?:mode|on|enable|true)\b/i,
 ];
 
 function isSettingsTamper(command: string): boolean {
-	return SETTINGS_TAMPER_PATTERNS.some((re) => re.test(command));
+	// Evaluate each segment independently so regexes cannot span lines or
+	// shell separators (a bare "\n" between "cline" and "settings" used to
+	// combine into a false positive).
+	const segments = command.split(/[\n|;&]+/);
+	return segments.some((segment) =>
+		SETTINGS_TAMPER_PATTERNS.some((re) => re.test(segment)),
+	);
 }
 
 function branchHasChangelogChange(root: string): boolean {
