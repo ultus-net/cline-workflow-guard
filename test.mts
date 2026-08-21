@@ -203,6 +203,45 @@ plugin.setup({}, { workspaceInfo: { rootPath: root } }); // restore
 writeFileSync(join(root, "TASKS.md"), "# Tasks\n- [ ] do thing\n");
 check("non-git workspace: check-off allowed", !(await call("editor", { path: join(root, "TASKS.md"), old_text: "- [ ] do thing", new_text: "- [x] do thing" })));
 
+console.log("— Policy 14: TODO ↔ TASKS correspondence —");
+{
+  const repo4 = mkdtempSync(join(tmpdir(), "wg-corr-"));
+  spawnSync("git", ["init", "-b", "main"], { cwd: repo4 });
+  spawnSync("git", ["config", "user.email", "t@example.com"], { cwd: repo4 });
+  spawnSync("git", ["config", "user.name", "Test"], { cwd: repo4 });
+  writeFileSync(join(repo4, "TODO.md"), "# Todo\n- [ ] (auth) Add login flow\n");
+  writeFileSync(join(repo4, "TASKS.md"), "# Tasks\n- [ ] (auth) Build login form\n");
+  spawnSync("git", ["add", "."], { cwd: repo4 });
+  spawnSync("git", ["commit", "-m", "init"], { cwd: repo4 });
+  spawnSync("git", ["switch", "-c", "feat/z"], { cwd: repo4 });
+  plugin.setup({}, { workspaceInfo: { rootPath: repo4 } });
+  const editTodo = (old_text: string, new_text: string) => call("editor", { path: join(repo4, "TODO.md"), old_text, new_text });
+  const editTasks = (old_text: string, new_text: string) => call("editor", { path: join(repo4, "TASKS.md"), old_text, new_text });
+  // Orphan: adding a TASKS item whose label is not in TODO.
+  check("orphan task without TODO parent blocked", blocked(await editTasks("- [ ] (auth) Build login form", "- [ ] (auth) Build login form\n- [ ] (billing) Add invoices")));
+  // Un-started: adding a TODO item with no TASKS breakdown.
+  check("un-started TODO item blocked", blocked(await editTodo("- [ ] (auth) Add login flow", "- [ ] (auth) Add login flow\n- [ ] (billing) Add invoices")));
+  // Checking off a TODO item is allowed even though TASKS still has the label
+  // (checked TODO items are exempt — they're heading for cleanup).
+  check("checking off TODO parent allowed", !(await editTodo("- [ ] (auth) Add login flow", "- [x] (auth) Add login flow")));
+  // The TODO check-off consumed the baseline; commit real work before the
+  // task check-off (Policy 10: commit-per-task).
+  writeFileSync(join(repo4, "login-form.ts"), "export {};\n");
+  spawnSync("git", ["add", "."], { cwd: repo4 });
+  spawnSync("git", ["commit", "-m", "build login form"], { cwd: repo4 });
+  // Working a task whose TODO parent exists: fine.
+  check("task check-off with matching parent allowed", !(await editTasks("- [ ] (auth) Build login form", "- [x] (auth) Build login form")));
+  // Single-file workflow: no TODO.md → correspondence skipped.
+  rmSync(join(repo4, "TODO.md"));
+  writeFileSync(join(repo4, "TASKS.md"), "# Tasks\n- [ ] (solo) lone file task\n");
+  writeFileSync(join(repo4, "solo.ts"), "export {};\n");
+  spawnSync("git", ["add", "."], { cwd: repo4 });
+  spawnSync("git", ["commit", "-m", "solo work"], { cwd: repo4 });
+  check("single-file workflow skips correspondence", !(await editTasks("- [ ] (solo) lone file task", "- [x] (solo) lone file task")));
+  rmSync(repo4, { recursive: true, force: true });
+  plugin.setup({}, { workspaceInfo: { rootPath: root } }); // restore
+}
+
 console.log("— Labels: shell rewrites of task lists —");
 {
   const repo3 = mkdtempSync(join(tmpdir(), "wg-shellwrite-"));

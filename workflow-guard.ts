@@ -95,6 +95,9 @@ const CHANGELOG_SECTION_RE = /changelog\s*:|^#+\s*changelog\b/im;
 
 const EDIT_TOOL_NAMES = new Set(["editor", "apply_patch"]);
 const TASK_LIST_FILES = ["TASKS.md", "TODO.md", "PLAN.md", ".cline/plan.md"];
+/** The backlog (parent items) vs. the active breakdown (child tasks). */
+const BACKLOG_FILE = "TODO.md";
+const BREAKDOWN_FILE = "TASKS.md";
 const UNCHECKED_TASK_RE = /^\s*[-*]\s+\[ \]\s+\S/m;
 
 function findActiveTaskList(root: string): string | undefined {
@@ -227,6 +230,100 @@ function changelogHasUnreleasedLabel(
 	return false;
 }
 
+// ── Backlog ↔ breakdown correspondence ───────────────────────────────────────
+// When both TODO.md (backlog of parent items) and TASKS.md (active breakdown)
+// exist, labels must correspond in both directions:
+//   - every TASKS label must exist in TODO (no orphan breakdown work), and
+//   - every unchecked TODO label must appear in TASKS (no silently
+//     un-started backlog items).
+// Checked-off TODO items and (no-commit) lines are exempt — they are on
+// their way out via the cleanup ceremony. Single-file workflows (only one of
+// the two files, or PLAN.md / .cline/plan.md instead) skip this check.
+
+function taskLinesWithLabels(content: string): Map<string, string> {
+	const map = new Map<string, string>();
+	for (const line of content.split("\n")) {
+		if (!TASK_LINE_RE.test(line)) continue;
+		const label = taskLabel(line);
+		if (label !== undefined) map.set(label, line);
+	}
+	return map;
+}
+
+/**
+ * Validate TODO.md ↔ TASKS.md label correspondence after a proposed edit to
+ * one of them. `editFile`/`editInput` describe the pending edit (already
+ * written to disk is NOT assumed — the file content on disk is pre-edit for
+ * the target being edited, so the caller passes the post-edit content).
+ */
+function backlogCorrespondenceGate(
+	root: string,
+	editFile: string,
+	postEditContent: string,
+): { skip: true; reason: string } | undefined {
+	let todoContent: string | undefined;
+	let tasksContent: string | undefined;
+	try {
+		todoContent =
+			editFile === BACKLOG_FILE
+				? postEditContent
+				: readFileSync(resolve(root, BACKLOG_FILE), "utf8");
+	} catch {
+		todoContent = undefined;
+	}
+	try {
+		tasksContent =
+			editFile === BREAKDOWN_FILE
+				? postEditContent
+				: readFileSync(resolve(root, BREAKDOWN_FILE), "utf8");
+	} catch {
+		tasksContent = undefined;
+	}
+	if (todoContent === undefined || tasksContent === undefined) {
+		return undefined; // One-file workflow — nothing to cross-check.
+	}
+
+	const todo = taskLinesWithLabels(todoContent);
+	const tasks = taskLinesWithLabels(tasksContent);
+
+	// Orphan breakdown: TASKS label missing from TODO entirely.
+	for (const [label, line] of tasks) {
+		if (!todo.has(label) && !NO_COMMIT_MARKER_RE.test(line)) {
+			console.error(
+				`[workflow-guard] blocked orphan task: (${label}) not in ${BACKLOG_FILE}`,
+			);
+			return {
+				skip: true,
+				reason:
+					`Blocked: task (${label}) in ${BREAKDOWN_FILE} has no parent ` +
+					`item in ${BACKLOG_FILE}. Every task must trace to a backlog ` +
+					`item — add "- [ ] (${label}) …" to ${BACKLOG_FILE} first, ` +
+					"or remove the orphan task.",
+			};
+		}
+	}
+
+	// Un-started backlog: unchecked TODO label absent from TASKS.
+	for (const [label, line] of todo) {
+		const todoUnchecked = UNCHECKED_LINE_RE.test(line);
+		if (todoUnchecked && !tasks.has(label)) {
+			console.error(
+				`[workflow-guard] blocked un-started backlog item: (${label}) not in ${BREAKDOWN_FILE}`,
+			);
+			return {
+				skip: true,
+				reason:
+					`Blocked: backlog item (${label}) in ${BACKLOG_FILE} is ` +
+					`unchecked but has no tasks in ${BREAKDOWN_FILE}. Break it ` +
+					"down into tasks — or, if it is genuinely deferred, check it " +
+					'off with a "(no-commit: deferred — reason)" marker so it is ' +
+					"recorded rather than dropped.",
+			};
+		}
+	}
+	return undefined;
+}
+
 function gitHead(root: string): string | undefined {
 	const result = spawnSync("git", ["rev-parse", "HEAD"], {
 		cwd: root,
@@ -314,6 +411,12 @@ interface TaskEditInfo {
 	/** Raw added/removed task lines (both checkbox states). */
 	addedTasks: string[];
 	removedTasks: string[];
+	/**
+	 * Best-effort post-edit content (removed lines deleted, added lines
+	 * appended). Exact ordering is unknowable for patches; label-set checks
+	 * only need the set of surviving lines.
+	 */
+	postContent: string;
 	/** True when every flipped line carries a (no-commit: …) marker. */
 	optedOut: boolean;
 }
@@ -366,10 +469,20 @@ function analyzeTaskEdit(
 	if (flipped.length === 0 && addedTasks.length === 0 && removedTasks.length === 0) {
 		return undefined; // Edit does not touch task lines at all.
 	}
+	// Simulate the post-edit content: drop removed task lines, append added
+	// ones. Ordering is approximate; the gates consume label sets.
+	const removedSet = new Set(removedTasks);
+	const postContent =
+		content
+			.split("\n")
+			.filter((l) => !removedSet.has(l))
+			.join("\n") +
+		(addedTasks.length > 0 ? "\n" + addedTasks.join("\n") : "");
 	return {
 		flipped: flipped.map(String),
 		addedTasks,
 		removedTasks,
+		postContent,
 		optedOut:
 			flipped.length > 0 &&
 			flipped.every((l) => NO_COMMIT_MARKER_RE.test(l)),
@@ -436,6 +549,10 @@ function taskCheckoffGate(
 		);
 		return { skip: true, reason: UNLABELED_TASK_REASON };
 	}
+
+	// ── TODO.md ↔ TASKS.md correspondence ──
+	const corr = backlogCorrespondenceGate(root, taskFile, info.postContent);
+	if (corr) return corr;
 
 	// ── Final cleanup: all tasks done → remove the list, log the work ──
 	// Completed tasks may only be removed once CHANGELOG.md records their

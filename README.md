@@ -23,6 +23,23 @@ All policies run as `beforeTool` / `beforeRun` hooks that execute as code and re
 | 11 | **Top-down order** | Checking off a task while an earlier task is still unchecked is blocked — tasks must be completed in list order (agents love skipping items). Obsolete tasks must be explicitly removed from the list first. |
 | 12 | **Task lifecycle** | Tasks may not silently disappear: while work is in progress, task lines cannot be deleted or reworded — they must be checked off (`- [x]`) or explicitly retired with a `(no-commit: obsolete — reason)` marker. Once **all** tasks are checked, removing them from the list is blocked until each task's label is recorded in `CHANGELOG.md` under an `## Unreleased` section (entries under older release headings don't count). Changelog edits themselves are exempt from the task-list gate so the ceremony can always be completed. |
 | 13 | **Mandatory task labels** | Every task line must carry a label — `- [ ] (auth) Add login form` — linking it to its parent TODO item and its changelog entry. Matching is by label, never by wording, so reworded changelog entries are accepted and reworded/duplicated tasks are detected. Applies to edit tools **and** shell heredoc rewrites of task-list files. |
+| 14 | **Backlog ↔ breakdown correspondence** | When both `TODO.md` (backlog) and `TASKS.md` (breakdown) exist, labels must correspond in both directions: every task must have a parent backlog item (no orphan work), and every unchecked backlog item must be broken down into tasks (no silently un-started items). Checked-off backlog items and `(no-commit)` lines are exempt. Single-file workflows are unaffected. |
+
+## The task workflow
+
+```
+TODO.md      - [ ] (auth) Add login flow         ← backlog: the what
+TASKS.md     - [ ] (auth) Build login form       ← breakdown: the how
+             - [ ] (auth) Wire session handler
+CHANGELOG.md ## Unreleased
+             - (auth) Add login flow             ← recorded on completion
+```
+
+1. Add items to `TODO.md`, each with a `(label)`.
+2. Break them down into labeled tasks in `TASKS.md`.
+3. Work top-down; one real commit per check-off.
+4. When everything is checked: record each label under `## Unreleased` in `CHANGELOG.md`, then remove the completed items from both lists.
+5. Repeat. Nothing is deleted without being recorded.
 
 ## Overrides ("unless otherwise specified")
 
