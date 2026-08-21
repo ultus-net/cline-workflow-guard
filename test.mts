@@ -165,6 +165,36 @@ writeFileSync(join(repo2, "src.txt"), "change");
 spawnSync("git", ["add", "."], { cwd: repo2 });
 spawnSync("git", ["commit", "-m", "work"], { cwd: repo2 });
 check("check-off allowed after new work commit", !(await editTask("- [ ] three", "- [x] three")));
+
+console.log("— Policy 12: task lifecycle (cleanup + changelog) —");
+// repo2 list is now: all three tasks checked (one was checked off via patch).
+setTasks("# Tasks\n- [x] one\n- [x] two (no-commit: verification only)\n- [x] three\n");
+// Mid-flight removal protection is moot here (all checked); test cleanup gate:
+check("cleanup blocked without CHANGELOG.md", blocked(await editTask("- [x] one\n", "")));
+writeFileSync(join(repo2, "CHANGELOG.md"), "# Changelog\n\n## 1.0.0\n- old release entry for one\n");
+check("cleanup blocked when entry only exists under an old release", blocked(await editTask("- [x] one\n", "")));
+check("changelog edit without Unreleased heading blocked in cleanup phase", blocked(await call("editor", { path: join(repo2, "CHANGELOG.md"), old_text: "# Changelog", new_text: "# Changelog\nmore" })));
+check("changelog edit adding Unreleased section allowed", !(await call("editor", { path: join(repo2, "CHANGELOG.md"), old_text: "# Changelog\n", new_text: "# Changelog\n\n## Unreleased\n- one\n- two\n- three\n" })));
+writeFileSync(join(repo2, "CHANGELOG.md"), "# Changelog\n\n## Unreleased\n- one\n- two\n- three\n\n## 1.0.0\n- old release\n");
+check("cleanup allowed once all tasks are in Unreleased", !(await editTask("# Tasks\n- [x] one\n- [x] two (no-commit: verification only)\n- [x] three\n", "# Tasks\n")));
+// Partial cleanup: 'three' not yet logged → still blocked.
+setTasks("# Tasks\n- [x] one\n- [x] three\n");
+writeFileSync(join(repo2, "CHANGELOG.md"), "# Changelog\n\n## Unreleased\n- one\n");
+check("partial cleanup blocked for unlogged task", blocked(await editTask("- [x] three\n", "")));
+check("partial cleanup allowed for logged task", !(await editTask("- [x] one\n", "")));
+// Fresh cycle: new unchecked tasks added to an empty list are fine.
+setTasks("# Tasks\n");
+check("adding fresh tasks after cleanup allowed", !(await editTask("# Tasks\n", "# Tasks\n- [ ] next thing\n")));
+// Mid-flight removal protection (unchecked task deleted).
+setTasks("# Tasks\n- [ ] alpha\n- [ ] beta\n");
+writeFileSync(join(repo2, "src2.txt"), "w");
+spawnSync("git", ["add", "."], { cwd: repo2 });
+spawnSync("git", ["commit", "-m", "w2"], { cwd: repo2 });
+check("mid-flight deletion of unchecked task blocked", blocked(await editTask("- [ ] beta\n", "")));
+check("mid-flight rewording of unchecked task blocked", blocked(await editTask("- [ ] beta", "- [ ] beta reworded")));
+check("mid-flight removal of (no-commit) checked line allowed", !(await editTask("- [ ] alpha", "- [x] alpha (no-commit: docs)")));
+setTasks("# Tasks\n- [x] alpha (no-commit: docs)\n- [ ] beta\n");
+check("obsolete marked checked line removal allowed", !(await editTask("- [x] alpha (no-commit: docs)\n", "")));
 rmSync(repo2, { recursive: true, force: true });
 plugin.setup({}, { workspaceInfo: { rootPath: root } }); // restore
 // Non-git workspace: check-offs unaffected.

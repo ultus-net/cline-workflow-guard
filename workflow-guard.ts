@@ -127,6 +127,40 @@ function findActiveTaskList(root: string): string | undefined {
 const TASK_STATE_FILE = ".cline/task-state.json";
 const NO_COMMIT_MARKER_RE = /\(no-commit(?::[^)]*)?\)/i;
 const CHECKED_TASK_RE = /^\s*[-*]\s+\[[xX]\]/gm;
+const TASK_LINE_RE = /^\s*[-*]\s+\[[ xX]\]/;
+const CHANGELOG_FILE = "CHANGELOG.md";
+
+/**
+ * True when a changelog entry exists for `task` under a section that comes
+ * before any versioned release heading (i.e. the "Unreleased" bucket, whether
+ * or not the heading is spelled that way). Older release sections are not
+ * re-scanned, so new work must produce new entries.
+ */
+function changelogHasUnreleasedEntry(content: string, task: string): boolean {
+	let inUnreleased = false;
+	let foundHeading = false;
+	for (const line of content.split("\n")) {
+		const heading = line.match(/^#{1,6}\s+(.*)$/);
+		if (heading) {
+			const title = heading[1] ?? "";
+			if (/unreleased/i.test(title)) {
+				foundHeading = true;
+				inUnreleased = true;
+				continue;
+			}
+			if (/\d+\.\d+/.test(title) || (foundHeading && inUnreleased)) {
+				// Versioned release (or any heading after Unreleased) — the
+				// unreleased bucket is over.
+				inUnreleased = false;
+			}
+			continue;
+		}
+		if (inUnreleased && line.includes(task)) {
+			return true;
+		}
+	}
+	return false;
+}
 
 function gitHead(root: string): string | undefined {
 	const result = spawnSync("git", ["rev-parse", "HEAD"], {
@@ -163,8 +197,8 @@ function writeTaskState(root: string, state: TaskState): void {
 	}
 }
 
-const UNCHECKED_LINE_RE = /^\s*[-*]\s+\[ \]/;
-const CHECKED_LINE_RE = /^\s*[-*]\s+\[[xX]\]/;
+const UNCHECKED_LINE_RE = /^\s*[-*]\s+\[ \]/m;
+const CHECKED_LINE_RE = /^\s*[-*]\s+\[[xX]\]/m;
 
 /** Exact-match a tool target path against the known task-list files. */
 function taskListNameForTarget(
@@ -209,24 +243,27 @@ function taskText(line: string): string {
 		.trim();
 }
 
-interface CheckoffInfo {
-	/** Checked task lines added by this edit. */
+interface TaskEditInfo {
+	/** Task text of lines checked off by this edit ([ ] → [x]). */
 	flipped: string[];
+	/** Raw added/removed task lines (both checkbox states). */
+	addedTasks: string[];
+	removedTasks: string[];
 	/** True when every flipped line carries a (no-commit: …) marker. */
 	optedOut: boolean;
 }
 
 /**
- * Detect task check-offs in an edit-tool call.
- * Handles both the editor tool (old_text/new_text) and apply_patch
- * (+/- lines inside the patch payload).
+ * Analyze a task-list edit (editor old_text/new_text or apply_patch payload)
+ * in terms of task lines added, removed, and checked off.
  */
-function detectCheckoff(
+function analyzeTaskEdit(
 	content: string,
 	input: unknown,
-): CheckoffInfo | undefined {
+): TaskEditInfo | undefined {
 	const record = asRecord(input);
-	const flipped: string[] = [];
+	let added: string[];
+	let removed: string[];
 
 	const patch =
 		typeof record?.input === "string"
@@ -235,45 +272,42 @@ function detectCheckoff(
 				? record.patch
 				: undefined;
 	if (patch !== undefined) {
-		const added = patch
+		added = patch
 			.split("\n")
 			.filter((l) => l.startsWith("+") && !l.startsWith("+++"))
 			.map((l) => l.slice(1));
-		const removed = patch
+		removed = patch
 			.split("\n")
 			.filter((l) => l.startsWith("-") && !l.startsWith("---"))
 			.map((l) => l.slice(1));
-		const removedUnchecked = new Set(
-			removed.filter((l) => UNCHECKED_LINE_RE.test(l)).map(taskText),
-		);
-		for (const line of added) {
-			if (CHECKED_LINE_RE.test(line) && removedUnchecked.has(taskText(line))) {
-				flipped.push(line);
-			}
-		}
 	} else {
 		const oldText =
 			typeof record?.old_text === "string" ? record.old_text : "";
 		const newText =
 			typeof record?.new_text === "string" ? record.new_text : "";
-		if (!newText) return undefined;
-		const oldUnchecked = new Set(
-			oldText
-				.split("\n")
-				.filter((l) => UNCHECKED_LINE_RE.test(l))
-				.map(taskText),
-		);
-		for (const line of newText.split("\n")) {
-			if (CHECKED_LINE_RE.test(line) && oldUnchecked.has(taskText(line))) {
-				flipped.push(line);
-			}
-		}
+		if (!newText && !oldText) return undefined;
+		added = newText.split("\n");
+		removed = oldText.split("\n");
 	}
 
-	if (flipped.length === 0) return undefined;
+	const addedTasks = added.filter((l) => TASK_LINE_RE.test(l));
+	const removedTasks = removed.filter((l) => TASK_LINE_RE.test(l));
+	const removedUnchecked = new Set(
+		removedTasks.filter((l) => UNCHECKED_LINE_RE.test(l)).map(taskText),
+	);
+	const flipped = addedTasks.filter(
+		(l) => CHECKED_LINE_RE.test(l) && removedUnchecked.has(taskText(l)),
+	);
+	if (flipped.length === 0 && addedTasks.length === 0 && removedTasks.length === 0) {
+		return undefined; // Edit does not touch task lines at all.
+	}
 	return {
-		flipped,
-		optedOut: flipped.every((l) => NO_COMMIT_MARKER_RE.test(l)),
+		flipped: flipped.map(String),
+		addedTasks,
+		removedTasks,
+		optedOut:
+			flipped.length > 0 &&
+			flipped.every((l) => NO_COMMIT_MARKER_RE.test(l)),
 	};
 }
 
@@ -324,9 +358,94 @@ function taskCheckoffGate(
 	} catch {
 		return undefined; // Cannot read the list — other policies handle it.
 	}
-	const info = detectCheckoff(content, input);
-	if (!info) return undefined; // Not a check-off edit.
+	const info = analyzeTaskEdit(content, input);
+	if (!info) return undefined; // Edit does not touch task lines.
 
+	// ── Final cleanup: all tasks done → remove the list, log the work ──
+	// The completed tasks may only be removed from the list once CHANGELOG.md
+	// records them under Unreleased — otherwise tasks silently vanish.
+	if (!UNCHECKED_LINE_RE.test(content)) {
+		const removedChecked = info.removedTasks.filter((l) =>
+			CHECKED_LINE_RE.test(l),
+		);
+		if (removedChecked.length > 0) {
+			if (info.optedOut) return undefined;
+			let changelog: string;
+			try {
+				changelog = readFileSync(resolve(root, CHANGELOG_FILE), "utf8");
+			} catch {
+				console.error(
+					"[workflow-guard] blocked task cleanup: no CHANGELOG.md",
+				);
+				return {
+					skip: true,
+					reason:
+						`Blocked: all tasks are complete. Before removing them from ` +
+						`${taskFile}, create ${CHANGELOG_FILE} with an '## Unreleased' ` +
+						"section listing what was done (one bullet per task).",
+				};
+			}
+			const missing = removedChecked.filter(
+				(l) => !changelogHasUnreleasedEntry(changelog, taskText(l)),
+			);
+			if (missing.length > 0) {
+				console.error(
+					`[workflow-guard] blocked task cleanup: no changelog entry for "${taskText(missing[0] ?? "").slice(0, 80)}"`,
+				);
+				return {
+					skip: true,
+					reason:
+						"Blocked: completed tasks may only be removed from the list " +
+						`once they are recorded in ${CHANGELOG_FILE} under an ` +
+						`'## Unreleased' section. Missing entry for: ` +
+						missing.map((l) => `"${taskText(l).slice(0, 60)}"`).join(", ") +
+						". Add the changelog entries first (this edit is exempt from " +
+						"the commit-per-task gate), then remove the tasks.",
+				};
+			}
+			// Legitimate cleanup — reset the baseline for the next request.
+			const head = gitHead(root);
+			if (head) writeTaskState(root, { head });
+			return undefined;
+		}
+		// Pure additions to an all-checked list start the next request cycle.
+		if (info.flipped.length === 0) {
+			if (info.addedTasks.length > 0) {
+				const head = gitHead(root);
+				if (head) writeTaskState(root, { head });
+			}
+			return undefined;
+		}
+	}
+
+	if (info.flipped.length === 0) {
+		// ── Task-line removals mid-flight ──
+		// Only checked lines carrying an explicit (no-commit: reason) marker
+		// may be deleted; unchecked tasks must be checked off, not vanish.
+		const flippedTexts = new Set(info.flipped.map(taskText));
+		const removedChecked = info.removedTasks.filter(
+			(l) => CHECKED_LINE_RE.test(l) && !flippedTexts.has(taskText(l)),
+		);
+		if (
+			removedChecked.length > 0 &&
+			removedChecked.every((l) => NO_COMMIT_MARKER_RE.test(l))
+		) {
+			return undefined; // Documented removals (obsolete task, with reason).
+		}
+		console.error(
+			"[workflow-guard] blocked task removal: tasks must be checked off, not deleted",
+		);
+		return {
+			skip: true,
+			reason:
+				"Blocked: task lines may not be removed from the list while work " +
+				"is in progress — check them off (- [x]) instead, so nothing goes " +
+				"missing. Once ALL tasks are checked, remove them together and " +
+				`record them in ${CHANGELOG_FILE} under '## Unreleased'. If a ` +
+				'task is genuinely obsolete, mark it "(no-commit: obsolete — ' +
+				'reason)" before removing it.',
+		};
+	}
 	// ── Top-down order: the first unchecked task must be the one completed ──
 	const firstUnchecked = content.split("\n").find((l) => UNCHECKED_LINE_RE.test(l));
 	if (firstUnchecked) {
@@ -391,6 +510,66 @@ function taskCheckoffGate(
 			"Commit the work first (`git add … && git commit -m …`), or — if " +
 			"the task needs no commit (docs-only, verification) — append " +
 			"\"(no-commit: reason)\" to the task line.",
+	};
+}
+
+/**
+ * Gate changelog edits while the task list is in its all-checked state:
+ * the completed work must be recorded under '## Unreleased' (or, in a
+ * changelog with no release sections yet, at the top of the file).
+ */
+function changelogGate(
+	root: string,
+	input: unknown,
+): { skip: true; reason: string } | undefined {
+	const taskFile = TASK_LIST_FILES.find((name) => {
+		try {
+			const content = readFileSync(resolve(root, name), "utf8");
+			return content.split("\n").some((l) => TASK_LINE_RE.test(l));
+		} catch {
+			return false;
+		}
+	});
+	if (!taskFile) return undefined; // No task list — nothing to enforce.
+	let content: string;
+	try {
+		content = readFileSync(resolve(root, taskFile), "utf8");
+	} catch {
+		return undefined;
+	}
+	if (UNCHECKED_LINE_RE.test(content)) return undefined; // Work in progress.
+
+	const record = asRecord(input);
+	const addedText =
+		typeof record?.new_text === "string"
+			? record.new_text
+			: typeof record?.input === "string"
+				? record.input // apply_patch payload
+				: typeof record?.patch === "string"
+					? record.patch
+					: "";
+	if (/(^|\n|\+)#{1,6}\s*.*unreleased/i.test(addedText)) return undefined;
+
+	let changelog = "";
+	try {
+		changelog = readFileSync(resolve(root, CHANGELOG_FILE), "utf8");
+	} catch {
+		// No changelog yet — a creation edit without an Unreleased heading is
+		// still a reasonable start (the heading check applies to the task
+		// cleanup, which re-verifies entries per task). Allow.
+		return undefined;
+	}
+	if (/^#{1,6}\s+.*unreleased/im.test(changelog)) return undefined;
+
+	console.error(
+		"[workflow-guard] changelog edit while tasks await cleanup lacks an '## Unreleased' section",
+	);
+	return {
+		skip: true,
+		reason:
+			"Blocked: all tasks are complete but not yet recorded. Add the " +
+			"entries under an '## Unreleased' heading in CHANGELOG.md, then " +
+			`remove the completed tasks from ${taskFile}.`,
 	};
 }
 
@@ -706,6 +885,23 @@ const plugin: AgentPlugin = {
 						(t) => taskListNameForTarget(workspaceRoot, t) !== undefined,
 					);
 
+				// Changelog writes are part of the task-completion ceremony, so
+				// they are exempt from the task-list gate — but when all tasks
+				// are complete the entry must appear under '## Unreleased'.
+				const touchesOnlyChangelog =
+					targets.length > 0 &&
+					targets.every(
+						(t) =>
+							resolve(workspaceRoot, t) ===
+							resolve(workspaceRoot, CHANGELOG_FILE),
+					);
+				if (touchesOnlyChangelog) {
+					const gate = changelogGate(workspaceRoot, input);
+					if (gate) return gate;
+					if (!onProtectedBranch(workspaceRoot)) return undefined;
+					// On main/master, fall through to the branch guard below.
+				}
+
 				// ── Policy 10: commit-per-task + top-down check-off gate ──
 				if (taskFile) {
 					const gate = taskCheckoffGate(workspaceRoot, taskFile, input);
@@ -713,7 +909,10 @@ const plugin: AgentPlugin = {
 				}
 
 				// ── Policy 9: no edits on protected branches ──────────────
-				if (!touchesOnlyTaskLists && onProtectedBranch(workspaceRoot)) {
+				if (
+					!touchesOnlyTaskLists &&
+					onProtectedBranch(workspaceRoot)
+				) {
 					console.error(
 						`[workflow-guard] blocked ${toolCall.toolName}: on protected branch ${currentGitBranch(workspaceRoot)}`,
 					);
