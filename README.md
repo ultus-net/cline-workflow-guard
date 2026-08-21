@@ -2,17 +2,19 @@
 
 A [Cline](https://github.com/cline/cline) plugin that enforces workflow discipline through **deterministic hooks** — not prompt rules that models can ignore.
 
+All policies run as `beforeTool` / `runStart` hooks (SDK/CLI/Kanban — not the VS Code/JetBrains extension) that execute as code and return `{ skip: true }` to block disallowed actions. Tool names match the current built-in set (`bash`, `editor`, `apply_patch`); legacy names are matched for older runtimes.
+
 ## What it enforces
 
 All policies run as `beforeTool` / `runStart` hooks that execute as code and return `{ skip: true }` to block disallowed actions.
 
 | # | Policy | Enforcement |
 |---|--------|-------------|
-| 1 | **Task breakdown** | Edit tools (`editor`, `apply_patch`, `write_file`) are blocked until the workspace root has `TASKS.md` / `TODO.md` / `PLAN.md` / `.cline/plan.md` containing at least one unchecked `- [ ]` item. Once all items are checked, edits block again — forcing a fresh task list per request. The task-list file itself is exempt. |
+| 1 | **Task breakdown** | Edit tools (`editor`, `apply_patch`) are blocked until the workspace root has `TASKS.md` / `TODO.md` / `PLAN.md` / `.cline/plan.md` containing at least one unchecked `- [ ]` item. Once all items are checked, edits block again — forcing a fresh task list per request. The task-list file itself is exempt. |
 | 2 | **No pushes to main** | `git push … main/master` is blocked in any shell command. Feature branches are unaffected. |
 | 3 | **PR changelog** | `gh pr create` is blocked unless the PR body contains a `Changelog:` section or the branch diff modifies a CHANGELOG file. |
-| 4 | **Live-system guard** | Blocks mutations against live infrastructure: `kubectl` mutations, `helm install/upgrade`, `terraform/tofu apply/destroy`, `pulumi up`, `az`/`aws`/`gcloud` resource mutations, direct DB mutations (`psql`/`mysql`/`mongosh`/`redis-cli`/`sqlite3`), remote `curl` POST/PUT/PATCH/DELETE (localhost exempt), and `ssh user@host <cmd>`. Read-only ops (`kubectl get`, `terraform plan`, `az … show/list`) pass. |
-| 5 | **Azure DevOps** | Covers `az repos/pipelines/boards/artifacts` mutations and `az devops invoke` with mutating HTTP methods. |
+| 4 | **Destructive-command guard** | Blocks only *destructive* CLI operations — non-destructive mutations (`kubectl apply`, `terraform apply`, `helm upgrade`, `az … create/update`, DB inserts, `curl` POST/PUT/PATCH, `ssh`) are allowed. Blocked: `kubectl delete/drain`, `helm uninstall/rollback`, `terraform/tofu destroy`, `pulumi destroy`, `az`/`aws`/`gcloud` delete/terminate/purge, DB `drop/delete/truncate/flushall`, remote `curl` DELETE (localhost exempt), and `git push --force`. |
+| 5 | **Azure DevOps** | Covers destructive `az repos/pipelines/boards/artifacts` operations (`delete`, `abandon`). |
 | 6 | **MCP mutation guard** | MCP tools bypass the shell, so they're matched by name: GitHub and Azure/azmcp MCP tools with mutation verbs (`_create`, `_update`, `_delete`, `_merge`, …) are blocked; read-only tools (`_get`, `_list`, `_search`, …) pass. |
 | 7 | **Settings tamper guard** | Blocks the agent from modifying its own approval gates: `cline yolo`, `cline config`, and writes to Cline settings files. Approval settings can only be changed manually by the user in the UI. |
 | 8 | **Plan→Act gate** | Works together with Cline settings: keep `modeTransitions` / YOLO disabled so every Plan→Act switch requires user approval. `runStart` logs a reminder each run. |
@@ -21,22 +23,34 @@ All policies run as `beforeTool` / `runStart` hooks that execute as code and ret
 
 Hooks can't read chat intent, so overrides are explicit and auditable:
 
-- **Live-system changes:** append `# allow-live` to the command, or set `WORKFLOW_GUARD_ALLOW_LIVE=1`.
+- **Destructive commands:** append `# allow-live` to the command, or set `WORKFLOW_GUARD_ALLOW_LIVE=1`.
 - **MCP mutations:** only `WORKFLOW_GUARD_ALLOW_LIVE=1` (MCP calls carry no command string).
 - **Everything else:** no override — by design (that's the point of a policy).
 
 ## Install
 
-```bash
-cline plugin install https://github.com/ultus-net/cline-workflow-guard/blob/main/workflow-guard.ts --cwd .
-```
+> **Note:** plugins currently work with the **Cline CLI, SDK, and Kanban** — they are not yet supported in the VS Code / JetBrains extension.
 
-Or clone and install locally:
+Install directly from this repo (recommended):
 
 ```bash
-git clone https://github.com/ultus-net/cline-workflow-guard
-cline plugin install ./cline-workflow-guard/workflow-guard.ts --cwd .
+cline plugin install https://github.com/ultus-net/cline-workflow-guard.git
 ```
+
+Install per-project (`<project>/.cline/plugins` instead of `~/.cline/plugins`):
+
+```bash
+cline plugin install https://github.com/ultus-net/cline-workflow-guard.git --cwd .
+```
+
+Or install a single file / local clone:
+
+```bash
+cline plugin install https://github.com/ultus-net/cline-workflow-guard/blob/main/workflow-guard.ts
+cline plugin install ./cline-workflow-guard/workflow-guard.ts
+```
+
+Verify it's loaded with `cline config` (check the plugin tab).
 
 ## Recommended companion settings
 

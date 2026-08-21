@@ -19,9 +19,12 @@
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import type { AgentPlugin } from "@cline/core";
+import type { AgentPlugin } from "@cline/sdk";
 
-const SHELL_TOOL_NAMES = new Set(["run_commands", "execute_command", "bash", "shell"]);
+// Current built-in tools (docs.cline.bot/tools-reference): bash, editor,
+// apply_patch, read_files, search, fetch_web, ask_question. Legacy names are
+// kept for compatibility with older runtimes.
+const SHELL_TOOL_NAMES = new Set(["bash", "run_commands", "execute_command", "shell"]);
 
 let workspaceRoot = process.cwd();
 
@@ -56,16 +59,16 @@ function normalize(cmd: string): string {
 	return cmd.replace(/\s+/g, " ");
 }
 
+// Matches "git push ... main|master" as a ref (not a path like
+// feature/main-fix or origin/main-backup).
 const PUSH_TO_MAIN_RE =
-	/\bgit\s+push\b[^|;&]*\b(main|master)\b/;
-const PUSH_TO_MAIN_ANYWHERE_RE =
-	/\bgit\s+push\b(?:[^|;&]*\s)(?:--force-with-lease|--force|-f)?[^|;&]*\b(main|master)\b/;
+	/\bgit\s+push\b[^|;&]*(?:\s|\/|^)(?:main|master)(?![\w./-])/;
 const PR_CREATE_RE = /\bgh\s+pr\s+create\b/;
 const CHANGELOG_SECTION_RE = /changelog/i;
 
 // ── Task-list gate ───────────────────────────────────────────────────────────
 
-const EDIT_TOOL_NAMES = new Set(["editor", "apply_patch", "write_file"]);
+const EDIT_TOOL_NAMES = new Set(["editor", "apply_patch"]);
 const TASK_LIST_FILES = ["TASKS.md", "TODO.md", "PLAN.md", ".cline/plan.md"];
 const UNCHECKED_TASK_RE = /^\s*[-*]\s+\[ \]\s+\S/m;
 
@@ -94,24 +97,25 @@ interface LivePattern {
 }
 
 const LIVE_MUTATION_PATTERNS: LivePattern[] = [
-	// Infrastructure / orchestration mutations
-	{ re: /\bkubectl\s+(apply|create|delete|patch|replace|scale|rollout|drain|cordon|uncordon|taint|edit|set|annotate|label)\b/, what: "kubectl mutation" },
-	{ re: /\bhelm\s+(install|upgrade|uninstall|rollback|delete)\b/, what: "helm release change" },
-	{ re: /\b(terraform|tofu)\s+(apply|destroy|import|taint|untaint)\b/, what: "terraform/tofu state change" },
-	{ re: /\bpulumi\s+(up|destroy|import)\b/, what: "pulumi stack change" },
-	// Cloud CLI mutations
-	{ re: /\baz\s+\S+\s+(create|delete|update|set|start|stop|restart)\b/, what: "Azure resource mutation" },
-	// Azure DevOps mutations (az devops / az repos / az pipelines / az boards / az artifacts)
-	{ re: /\baz\s+(devops|repos|pipelines|boards|artifacts)\s+[\w-]*\s*(create|delete|update|set|start|stop|edit|queue|merge|complete|abandon|run)\b/, what: "Azure DevOps mutation" },
-	{ re: /\baz\s+devops\s+(invoke|service-endpoint|extension)\b[^|;&]*(--http-method\s+(POST|PUT|PATCH|DELETE)|--api-parameters\b[^|;&]*\b(create|delete|update))/, what: "Azure DevOps REST mutation" },
-	{ re: /\baws\s+\S+\s+(create|delete|put|update|terminate|start|stop|reboot|modify|attach|detach|run)-?\w*/, what: "AWS resource mutation" },
-	{ re: /\bgcloud\s+\S+\s+(create|delete|update|deploy|start|stop)\b/, what: "GCP resource mutation" },
-	// Database mutations via CLI clients
-	{ re: /\b(psql|mysql|mariadb|mongosh|mongo|redis-cli|sqlite3)\b[^|;&]*\b(insert|update|delete|drop|alter|truncate|create|grant|revoke)\b/i, what: "direct database mutation" },
-	// Remote HTTP mutations (localhost is fine — that's code-under-test)
-	{ re: /\bcurl\b[^|;&]*(-X\s*(POST|PUT|PATCH|DELETE)|--data\b|--request\s+(POST|PUT|PATCH|DELETE))[^|;&]*https?:\/\/(?!localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])/, what: "remote HTTP mutation" },
-	// Arbitrary remote command execution
-	{ re: /\bssh\s+\S+@\S+\s+['"]?/, what: "remote command over ssh" },
+	// Only DESTRUCTIVE operations are blocked. Create/update/apply/set-style
+	// commands are allowed — they're normal work and reviewable in diffs.
+	// Infrastructure / orchestration
+	{ re: /\bkubectl\s+(delete|drain|cordon)\b/, what: "destructive kubectl command" },
+	{ re: /\bkubectl\s+rollout\s+(undo|restart)\b/, what: "destructive kubectl rollout" },
+	{ re: /\bhelm\s+(uninstall|rollback|delete)\b/, what: "helm release removal/rollback" },
+	{ re: /\b(terraform|tofu)\s+destroy\b/, what: "terraform/tofu destroy" },
+	{ re: /\bpulumi\s+destroy\b/, what: "pulumi destroy" },
+	// Cloud CLI deletions
+	{ re: /\baz\s+\S+\s+(delete|purge)\b/, what: "Azure resource deletion" },
+	{ re: /\baz\s+(devops|repos|pipelines|boards|artifacts)\s+[\w-]*\s*(delete|abandon)\b/, what: "Azure DevOps deletion" },
+	{ re: /\baws\s+\S+\s+(delete|terminate)-?\w*\b/, what: "AWS resource deletion" },
+	{ re: /\bgcloud\s+\S+\s+(delete|abandon)\b/, what: "GCP resource deletion" },
+	// Database destruction via CLI clients (insert/update/create are allowed)
+	{ re: /\b(psql|mysql|mariadb|mongosh|mongo|redis-cli|sqlite3)\b[^|;&]*\b(drop|delete|truncate|flushall|flushdb)\b/i, what: "destructive database command" },
+	// Destructive remote HTTP calls (DELETE only; POST/PUT/PATCH are normal API work)
+	{ re: /\bcurl\b(?=[^|;&]*(?:(?<!\S)(?:-X|--request)\s*=?\s*DELETE))(?=[^|;&]*https?:\/\/(?!localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]))/, what: "remote HTTP DELETE" },
+	// Destructive git operations
+	{ re: /\bgit\s+push\b[^|;&]*(--force\b|--force-with-lease\b|\s-f\b)/, what: "force push" },
 ];
 
 function liveMutationIn(command: string): string | undefined {
@@ -125,8 +129,10 @@ function liveMutationIn(command: string): string | undefined {
 
 // ── MCP mutation tool guard ──────────────────────────────────────────────────
 // MCP tools bypass the shell entirely, so they need their own name-based
-// matching. Read-only tool names (get/list/search/show/query/describe/…)
-// are always allowed; mutating names are blocked unless explicitly allowed.
+// matching. Cline exposes MCP tools with names like `mcp__<server>__<tool>`;
+// some runtimes use plain `<server>_<tool>` names instead, so both forms are
+// matched. Read-only tool names (get/list/search/show/query/describe/…) are
+// always allowed; mutating names are blocked unless explicitly allowed.
 
 const MCP_MUTATION_VERB_RE =
 	/(_create|_update|_delete|_remove|_merge|_push|_close|_edit|_set|_fork|_trigger|_cancel|_rerun|_add|_assign|_approve|_complete|_abandon)/;
@@ -139,8 +145,10 @@ interface GuardedMcpServer {
 }
 
 const GUARDED_MCP_SERVERS: GuardedMcpServer[] = [
-	{ nameRe: /(^|_)github(_|$)/i, what: "GitHub" },
-	{ nameRe: /(^|_)(azure|azmcp|ado|devops)(_|$)/i, what: "Azure/Azure DevOps" },
+	{ nameRe: /(?:^|__)(?:github)(?:__|$)/i, what: "GitHub" },
+	{ nameRe: /(?:^|__)(?:azure|azmcp|ado|devops)(?:__|$)/i, what: "Azure/Azure DevOps" },
+	// Legacy flat naming: github_create_issue, azure_repos_pr_create, …
+	{ nameRe: /(^|_)(github|azure|azmcp|ado|devops)(_|$)/i, what: "GitHub/Azure DevOps" },
 ];
 
 function mcpMutationTool(toolName: string): string | undefined {
@@ -175,26 +183,34 @@ function isSettingsTamper(command: string): boolean {
 
 function branchHasChangelogChange(root: string): boolean {
 	try {
-		const result = spawnSync(
-			"git",
-			["diff", "--name-only", "origin/HEAD...HEAD"],
-			{ cwd: root, encoding: "utf8", timeout: 10_000 },
-		);
-		if (result.status !== 0) {
-			// Fall back: compare against the primary branch's merge base.
-			const fallback = spawnSync(
+		const baseCandidates = ["origin/HEAD", "origin/main", "origin/master"];
+		for (const base of baseCandidates) {
+			const mergeBase = spawnSync(
 				"git",
-				["diff", "--name-only", "$(git merge-base HEAD origin/main 2>/dev/null || git merge-base HEAD origin/master)"],
-				{ cwd: root, encoding: "utf8", timeout: 10_000, shell: "/bin/bash" },
+				["merge-base", "HEAD", base],
+				{ cwd: root, encoding: "utf8", timeout: 10_000 },
 			);
-			if (fallback.status !== 0) return false;
-			return fallback.stdout
-				.split("\n")
-				.some((f) => /changelog/i.test(f));
+			if (mergeBase.status !== 0 || !mergeBase.stdout.trim()) continue;
+			const diff = spawnSync(
+				"git",
+				["diff", "--name-only", `${mergeBase.stdout.trim()}...HEAD`],
+				{ cwd: root, encoding: "utf8", timeout: 10_000 },
+			);
+			if (diff.status !== 0) continue;
+			if (diff.stdout.split("\n").some((f) => /changelog/i.test(f))) {
+				return true;
+			}
 		}
-		return result.stdout
-			.split("\n")
-			.some((f) => /changelog/i.test(f));
+		// Last resort: diff against HEAD~1 (single-commit branches).
+		const last = spawnSync("git", ["diff", "--name-only", "HEAD~1"], {
+			cwd: root,
+			encoding: "utf8",
+			timeout: 10_000,
+		});
+		return (
+			last.status === 0 &&
+			last.stdout.split("\n").some((f) => /changelog/i.test(f))
+		);
 	} catch {
 		return false;
 	}
@@ -204,7 +220,25 @@ function prBodyIncludesChangelog(command: string): boolean {
 	// Handle inline --body "..." with a Changelog section.
 	const bodyMatch = command.match(/--body\s+(?:"([^"]*)"|'([^']*)')/);
 	const body = bodyMatch?.[1] ?? bodyMatch?.[2] ?? "";
-	return CHANGELOG_SECTION_RE.test(body);
+	if (CHANGELOG_SECTION_RE.test(body)) {
+		return true;
+	}
+	// Handle --body-file <path> / -F <path>: read the referenced file.
+	const bodyFileMatch = command.match(
+		/(?:--body-file|-F)\s+(?:"([^"]*)"|'([^']*)'|(\S+))/,
+	);
+	const bodyFile =
+		bodyFileMatch?.[1] ?? bodyFileMatch?.[2] ?? bodyFileMatch?.[3];
+	if (bodyFile) {
+		try {
+			return CHANGELOG_SECTION_RE.test(
+				readFileSync(resolve(workspaceRoot, bodyFile), "utf8"),
+			);
+		} catch {
+			return false;
+		}
+	}
+	return false;
 }
 
 const plugin: AgentPlugin = {
@@ -325,10 +359,7 @@ const plugin: AgentPlugin = {
 				}
 
 				// ── Policy 1: block git push to main/master ──────────────────
-				if (
-					PUSH_TO_MAIN_RE.test(command) ||
-					PUSH_TO_MAIN_ANYWHERE_RE.test(command)
-				) {
+				if (PUSH_TO_MAIN_RE.test(command)) {
 					console.error(
 						`[workflow-guard] blocked push to main/master: ${command}`,
 					);
