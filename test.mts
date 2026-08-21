@@ -23,8 +23,8 @@ const call = async (toolName: string, input: unknown) => {
 const shell = (cmd: string) => call("bash", { commands: [cmd] });
 const blocked = (r: unknown): boolean => !!(r as { skip?: boolean } | undefined)?.skip;
 
-await plugin.hooks.runStart({});
-check("runStart runs without error", true);
+await plugin.hooks.beforeRun({});
+check("beforeRun runs without error", true);
 
 console.log("— Policy 1: task-list gate —");
 writeFileSync(join(root, "TASKS.md"), "# Tasks\n- [ ] do thing\n- [x] done\n");
@@ -43,6 +43,10 @@ check("block git push origin master", blocked(await shell("git push origin maste
 check("block git push --force origin main", blocked(await shell("git push --force origin main")));
 check("allow git push origin feature/x", !(await shell("git push origin feature/x")));
 check("allow push to main-backup (ref-like path)", !(await shell("git push origin main-backup")));
+check("block refspec push HEAD:main", blocked(await shell("git push origin HEAD:main")));
+check("block refspec push HEAD:master", blocked(await shell("git push origin HEAD:master")));
+check("block branch deletion push :main", blocked(await shell("git push origin :main")));
+check("allow refspec push HEAD:feat/x", !(await shell("git push origin HEAD:feat/x")));
 
 console.log("— Policy 3: PR changelog —");
 check("block gh pr create without changelog", blocked(await shell("gh pr create --title t --body 'no changes here'")));
@@ -94,6 +98,8 @@ check("block cline config set autoApprove", blocked(await shell("cline config se
 check("block cline settings", blocked(await shell("cline settings set readFiles true")));
 check("block echo yolo mode", blocked(await shell("enable yolo mode now")));
 check("block writing auto-approve.json", blocked(await shell(`echo '{}' > ${root}/settings/auto-approve.json`)));
+check("block editor write to auto-approve.json (edit-tool path)", blocked(await call("editor", { path: "/var/home/x/.cline/data/settings/auto-approve.json", new_text: "{}" })));
+check("block apply_patch on auto-approve.json (edit-tool path)", blocked(await call("apply_patch", { input: "*** Begin Patch\n*** Update File: /var/home/x/.cline/data/settings/auto-approve.json\n@@\n+{}\n*** End Patch" })));
 check("block writing ~/.cline/settings/vscode-cline.json", blocked(await shell(`echo '{}' > /var/home/x/.cline/settings/vscode-cline.json`)));
 check("block saoudrizwan state.db write", blocked(await shell(`rm /var/home/x/.config/Code/User/globalStorage/saoudrizwan.claude-dev/settings/state.db`)));
 check("FIXED: multiline cmd w/ plugin dir + 'settings' + '.json' allowed", !(await shell("cd /var/home/csh/cline-workflow-guard\nls -la\ncat package.json\n# note about settings files\n# e.g. foo.json")));
@@ -119,6 +125,8 @@ check("on main: git merge blocked", blocked(await shell("git merge feature/x")))
 check("on main: git switch -c allowed (branch creation)", !(await shell("git switch -c feat/x")));
 check("on main: git status allowed", !(await shell("git status")));
 check("on main: task-list file edit still exempt", !(await call("editor", { path: join(repo, "TASKS.md"), new_text: "x" })));
+check("on main: apply_patch to task list still exempt", !(await call("apply_patch", { input: "*** Begin Patch\n*** Update File: TASKS.md\n@@\n+note\n*** End Patch" })));
+check("on main: docs/TASKS.md NOT exempt (exact match only)", blocked(await call("editor", { path: join(repo, "docs", "TASKS.md"), new_text: "x" })));
 spawnSync("git", ["switch", "-c", "feat/x"], { cwd: repo });
 check("on feature branch: editor allowed", !(await call("editor", { path: join(repo, "a.ts"), new_text: "x" })));
 check("on feature branch: git commit allowed", !(await shell("git commit -m test")));
@@ -139,13 +147,24 @@ spawnSync("git", ["commit", "-m", "init"], { cwd: repo2 });
 spawnSync("git", ["switch", "-c", "feat/x"], { cwd: repo2 });
 plugin.setup({}, { workspaceInfo: { rootPath: repo2 } });
 const editTask = (old_text: string, new_text: string) => call("editor", { path: join(repo2, "TASKS.md"), old_text, new_text });
+const patchTask = (from: string, to: string) => call("apply_patch", { input: `*** Begin Patch\n*** Update File: TASKS.md\n@@\n-${from}\n+${to}\n*** End Patch` });
+const setTasks = (c: string) => writeFileSync(join(repo2, "TASKS.md"), c);
 check("first check-off allowed (baseline commit)", !(await editTask("- [ ] one", "- [x] one")));
+setTasks("# Tasks\n- [x] one\n- [ ] two\n- [ ] three\n");
 check("second check-off blocked without new commit", blocked(await editTask("- [ ] two", "- [x] two")));
+check("out-of-order check-off blocked (three before two)", blocked(await editTask("- [ ] three", "- [x] three")));
+check("apply_patch check-off blocked without new commit", blocked(await patchTask("- [ ] two", "- [x] two")));
+check("apply_patch check-off with (no-commit) marker allowed", !(await patchTask("- [ ] two", "- [x] two (no-commit: verification only)")));
 check("check-off with (no-commit: reason) marker allowed", !(await editTask("- [ ] two", "- [x] two (no-commit: verification only)")));
+setTasks("# Tasks\n- [x] one\n- [x] two (no-commit: verification only)\n- [ ] three\n");
+// A commit that only touches the task list / plugin state must not count as work.
+spawnSync("git", ["add", "."], { cwd: repo2 });
+spawnSync("git", ["commit", "-m", "tasks only"], { cwd: repo2 });
+check("task-list-only commit does not satisfy gate", blocked(await editTask("- [ ] three", "- [x] three")));
 writeFileSync(join(repo2, "src.txt"), "change");
 spawnSync("git", ["add", "."], { cwd: repo2 });
 spawnSync("git", ["commit", "-m", "work"], { cwd: repo2 });
-check("check-off allowed after new commit", !(await editTask("- [ ] three", "- [x] three")));
+check("check-off allowed after new work commit", !(await editTask("- [ ] three", "- [x] three")));
 rmSync(repo2, { recursive: true, force: true });
 plugin.setup({}, { workspaceInfo: { rootPath: root } }); // restore
 // Non-git workspace: check-offs unaffected.

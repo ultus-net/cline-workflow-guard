@@ -21,9 +21,31 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import type { AgentPlugin } from "@cline/sdk";
 
-// Current built-in tools (docs.cline.bot/tools-reference): bash, editor,
-// apply_patch, read_files, search, fetch_web, ask_question. Legacy names are
-// kept for compatibility with older runtimes.
+// The published @cline/sdk dist typings currently degrade `AgentPlugin` to
+// `any` (the AgentExtension alias fails to resolve through the d.ts export
+// chain), so no contextual typing reaches hook implementations. The slices
+// below mirror the verified SDK contracts instead:
+//  - AgentBeforeToolContext / AgentBeforeToolResult
+//    (sdk/packages/shared/src/agent.ts — toolCall.toolName, skip/reason)
+//  - PluginSetupContext.workspaceInfo.rootPath
+//    (sdk/packages/shared/src/extensions/contribution-registry.ts)
+interface BeforeToolContext {
+	toolCall: { toolName: string };
+	input: unknown;
+}
+interface HookResult {
+	skip?: boolean;
+	reason?: string;
+}
+interface SetupContext {
+	workspaceInfo?: { rootPath?: string };
+}
+
+// Current runtime tool names (sdk/packages/core/src/extensions/tools/
+// definitions.ts): run_commands, editor, apply_patch, read_files,
+// search_codebase, fetch_web_content, ask_question. The docs page
+// (docs.cline.bot/tools-reference) still lists older aliases (bash, search,
+// fetch_web), so both current and legacy/alias names are matched.
 const SHELL_TOOL_NAMES = new Set(["bash", "run_commands", "execute_command", "shell"]);
 
 let workspaceRoot = process.cwd();
@@ -54,17 +76,20 @@ function extractCommands(input: unknown): string[] {
 	return commands;
 }
 
-/** Normalize a command for matching: strip env vars, excess whitespace. */
+/** Collapse excess whitespace for regex matching. */
 function normalize(cmd: string): string {
 	return cmd.replace(/\s+/g, " ");
 }
 
-// Matches "git push ... main|master" as a ref (not a path like
-// feature/main-fix or origin/main-backup).
+// Matches "git push ... main|master" as a ref or refspec target — including
+// "HEAD:main" (colon separator) and ":main" (branch deletion) — but not
+// paths like feature/main-fix or origin/main-backup.
 const PUSH_TO_MAIN_RE =
-	/\bgit\s+push\b[^|;&]*(?:\s|\/|^)(?:main|master)(?![\w./-])/;
+	/\bgit\s+push\b[^|;&]*(?:\s|\/|:|^)(?:main|master)(?![\w./:-])/;
 const PR_CREATE_RE = /\bgh\s+pr\s+create\b/;
-const CHANGELOG_SECTION_RE = /changelog/i;
+// A real changelog section: a "Changelog:" label or a "# Changelog" heading.
+// (A bare mention of the word "changelog" in prose does not count.)
+const CHANGELOG_SECTION_RE = /changelog\s*:|^#+\s*changelog\b/im;
 
 // ── Task-list gate ───────────────────────────────────────────────────────────
 
@@ -138,33 +163,154 @@ function writeTaskState(root: string, state: TaskState): void {
 	}
 }
 
-/** Simulate an edit-tool call on the task list; undefined when undecidable. */
-function simulateTaskListEdit(
-	content: string,
-	record: Record<string, unknown> | undefined,
+const UNCHECKED_LINE_RE = /^\s*[-*]\s+\[ \]/;
+const CHECKED_LINE_RE = /^\s*[-*]\s+\[[xX]\]/;
+
+/** Exact-match a tool target path against the known task-list files. */
+function taskListNameForTarget(
+	root: string,
+	target: string,
 ): string | undefined {
-	const oldText = typeof record?.old_text === "string" ? record.old_text : "";
-	const newText = typeof record?.new_text === "string" ? record.new_text : "";
-	if (oldText && content.includes(oldText)) {
-		return content.replace(oldText, newText);
-	}
-	if (!oldText && newText) {
-		// Insert/append or file creation — new lines only.
-		return content + "\n" + newText;
-	}
-	return undefined;
+	if (!target) return undefined;
+	const abs = resolve(root, target);
+	return TASK_LIST_FILES.find((name) => resolve(root, name) === abs);
 }
 
-function countChecked(content: string): number {
-	return content.match(CHECKED_TASK_RE)?.length ?? 0;
+/** File paths touched by an apply_patch payload. */
+function patchTargetPaths(patch: string): string[] {
+	const paths: string[] = [];
+	for (const m of patch.matchAll(
+		/^\*\*\*\s*(?:Add|Update|Delete) File:\s+(.+?)\s*$/gm,
+	)) {
+		if (m[1]) paths.push(m[1]);
+	}
+	return paths;
+}
+
+/** Tool input → target paths (editor: `path`; apply_patch: patch headers). */
+function editTargets(input: unknown): string[] {
+	const record = asRecord(input);
+	if (typeof record?.path === "string") return [record.path];
+	if (typeof input === "string") return [input]; // legacy editor-as-string
+	const patch =
+		typeof record?.input === "string"
+			? record.input
+			: typeof record?.patch === "string"
+				? record.patch
+				: "";
+	return patch ? patchTargetPaths(patch) : [];
+}
+
+/** Task text without checkbox / no-commit marker, for order comparison. */
+function taskText(line: string): string {
+	return line
+		.replace(/^\s*[-*]\s+\[[ xX]\]\s*/, "")
+		.replace(/\s*\(no-commit(?::[^)]*)?\)\s*/i, "")
+		.trim();
+}
+
+interface CheckoffInfo {
+	/** Checked task lines added by this edit. */
+	flipped: string[];
+	/** True when every flipped line carries a (no-commit: …) marker. */
+	optedOut: boolean;
 }
 
 /**
- * Gate task check-offs on a new commit since the last completed task.
- * Returns a skip result when the edit must be blocked, else undefined.
+ * Detect task check-offs in an edit-tool call.
+ * Handles both the editor tool (old_text/new_text) and apply_patch
+ * (+/- lines inside the patch payload).
+ */
+function detectCheckoff(
+	content: string,
+	input: unknown,
+): CheckoffInfo | undefined {
+	const record = asRecord(input);
+	const flipped: string[] = [];
+
+	const patch =
+		typeof record?.input === "string"
+			? record.input
+			: typeof record?.patch === "string"
+				? record.patch
+				: undefined;
+	if (patch !== undefined) {
+		const added = patch
+			.split("\n")
+			.filter((l) => l.startsWith("+") && !l.startsWith("+++"))
+			.map((l) => l.slice(1));
+		const removed = patch
+			.split("\n")
+			.filter((l) => l.startsWith("-") && !l.startsWith("---"))
+			.map((l) => l.slice(1));
+		const removedUnchecked = new Set(
+			removed.filter((l) => UNCHECKED_LINE_RE.test(l)).map(taskText),
+		);
+		for (const line of added) {
+			if (CHECKED_LINE_RE.test(line) && removedUnchecked.has(taskText(line))) {
+				flipped.push(line);
+			}
+		}
+	} else {
+		const oldText =
+			typeof record?.old_text === "string" ? record.old_text : "";
+		const newText =
+			typeof record?.new_text === "string" ? record.new_text : "";
+		if (!newText) return undefined;
+		const oldUnchecked = new Set(
+			oldText
+				.split("\n")
+				.filter((l) => UNCHECKED_LINE_RE.test(l))
+				.map(taskText),
+		);
+		for (const line of newText.split("\n")) {
+			if (CHECKED_LINE_RE.test(line) && oldUnchecked.has(taskText(line))) {
+				flipped.push(line);
+			}
+		}
+	}
+
+	if (flipped.length === 0) return undefined;
+	return {
+		flipped,
+		optedOut: flipped.every((l) => NO_COMMIT_MARKER_RE.test(l)),
+	};
+}
+
+/**
+ * True when the commits between `base` and `head` touch at least one file
+ * other than the task list itself or the plugin state file — committing the
+ * check-off alone must not satisfy the commit-per-task gate.
+ */
+function commitsIncludeWork(
+	root: string,
+	base: string,
+	head: string,
+	taskFile: string,
+): boolean {
+	const diff = spawnSync("git", ["diff", "--name-only", `${base}..${head}`], {
+		cwd: root,
+		encoding: "utf8",
+		timeout: 10_000,
+	});
+	if (diff.status !== 0) return true; // Cannot tell — do not block on git errors.
+	const excluded = new Set([taskFile, TASK_STATE_FILE]);
+	return diff.stdout
+		.split("\n")
+		.filter(Boolean)
+		.some((f) => !excluded.has(f));
+}
+
+/**
+ * Gate task check-offs:
+ *  1. Tasks must be completed top-down — checking off a task while an earlier
+ *     task is still unchecked is blocked (agents love skipping items).
+ *  2. A check-off requires a new commit with real work since the previous
+ *     completed task. Returns a skip result when the edit must be blocked.
  */
 function taskCheckoffGate(
 	root: string,
+	taskFile: string,
 	input: unknown,
 ): { skip: true; reason: string } | undefined {
 	// Feature-branch git repos only.
@@ -172,29 +318,67 @@ function taskCheckoffGate(
 	if (branch === undefined || branch === "" || PROTECTED_BRANCHES.has(branch)) {
 		return undefined;
 	}
-	const record = asRecord(input);
 	let content: string;
 	try {
-		content = readFileSync(resolve(root, "TASKS.md"), "utf8");
+		content = readFileSync(resolve(root, taskFile), "utf8");
 	} catch {
 		return undefined; // Cannot read the list — other policies handle it.
 	}
-	const post = simulateTaskListEdit(content, record);
-	if (post === undefined || countChecked(post) <= countChecked(content)) {
-		return undefined; // Not a check-off edit.
+	const info = detectCheckoff(content, input);
+	if (!info) return undefined; // Not a check-off edit.
+
+	// ── Top-down order: the first unchecked task must be the one completed ──
+	const firstUnchecked = content.split("\n").find((l) => UNCHECKED_LINE_RE.test(l));
+	if (firstUnchecked) {
+		const expected = taskText(firstUnchecked);
+		const skipped = info.flipped.filter((l) => taskText(l) !== expected);
+		const firstSkipped = skipped[0];
+		if (firstSkipped !== undefined) {
+			console.error(
+				`[workflow-guard] blocked out-of-order check-off: ${taskText(firstSkipped).slice(0, 80)}`,
+			);
+			return {
+				skip: true,
+				reason:
+					"Blocked: tasks must be completed top-down. The first unchecked " +
+					`task is "${expected.slice(0, 80)}" — complete and check off ` +
+					"tasks in order; do not skip ahead. If an earlier task is " +
+					"obsolete, remove it from the list first (with a note why).",
+			};
+		}
 	}
-	// Allow lines that explicitly opt out (must carry a reason).
-	if (NO_COMMIT_MARKER_RE.test(post) && !NO_COMMIT_MARKER_RE.test(content)) {
+
+	// ── Opt-out for doc-only / verification tasks ──
+	if (info.optedOut) {
 		const head = gitHead(root);
 		if (head) writeTaskState(root, { head });
 		return undefined;
 	}
+
+	// ── Commit-per-task checkpointing ──
 	const head = gitHead(root);
 	if (!head) return undefined; // No commits yet — nothing to compare.
 	const state = readTaskState(root);
-	if (state.head === undefined || state.head !== head) {
+	if (state.head === undefined) {
 		writeTaskState(root, { head });
-		return undefined; // New commit since last check-off — allowed.
+		return undefined; // First check-off — establish the baseline.
+	}
+	if (state.head !== head) {
+		if (commitsIncludeWork(root, state.head, head, taskFile)) {
+			writeTaskState(root, { head });
+			return undefined; // New work commit since last check-off — allowed.
+		}
+		console.error(
+			"[workflow-guard] blocked task check-off: commits since the last " +
+				"check-off only touch the task list itself",
+		);
+		return {
+			skip: true,
+			reason:
+				"Blocked: the commits since the previous check-off only modify " +
+				"the task list. Commit the actual work for this task first " +
+				"(`git add … && git commit -m …`), then check it off.",
+		};
 	}
 	console.error(
 		"[workflow-guard] blocked task check-off: no new commit since the last completed task",
@@ -318,8 +502,12 @@ function liveMutationIn(
 // matched. Read-only tool names (get/list/search/show/query/describe/…) are
 // always allowed; mutating names are blocked unless explicitly allowed.
 
+// Destructive verbs always block, even when the name also contains a
+// read-only token (e.g. "github_delete_log", "ado_abandon_status_update").
+const MCP_DESTRUCTIVE_VERB_RE =
+	/(_delete|_remove|_merge|_abandon|_push|_trigger|_rerun)/;
 const MCP_MUTATION_VERB_RE =
-	/(_create|_update|_delete|_remove|_merge|_push|_close|_edit|_set|_fork|_trigger|_cancel|_rerun|_add|_assign|_approve|_complete|_abandon)/;
+	/(_create|_update|_close|_edit|_set|_fork|_cancel|_add|_assign|_approve|_complete)/;
 const MCP_READ_ONLY_RE =
 	/(_get|_list|_search|_show|_query|_describe|_find|_read|_status|_diff|_log)/;
 
@@ -336,7 +524,11 @@ const GUARDED_MCP_SERVERS: GuardedMcpServer[] = [
 ];
 
 function mcpMutationTool(toolName: string): string | undefined {
-	if (!MCP_MUTATION_VERB_RE.test(toolName) || MCP_READ_ONLY_RE.test(toolName)) {
+	const mutating =
+		MCP_DESTRUCTIVE_VERB_RE.test(toolName) ||
+		(MCP_MUTATION_VERB_RE.test(toolName) &&
+			!MCP_READ_ONLY_RE.test(toolName));
+	if (!mutating) {
 		return undefined;
 	}
 	for (const { nameRe, what } of GUARDED_MCP_SERVERS) {
@@ -373,6 +565,22 @@ function isSettingsTamper(command: string): boolean {
 	return segments.some((segment) =>
 		SETTINGS_TAMPER_PATTERNS.some((re) => re.test(segment)),
 	);
+}
+
+// Edit tools (editor / apply_patch) bypass the shell entirely, so the
+// settings tamper guard must also match the *target path* of file edits.
+// Approval settings may only be changed manually by the user in the UI.
+const SETTINGS_FILE_PATTERNS: RegExp[] = [
+	/(^|[/\\])auto-approve\.json$/i,
+	// Global Cline data directory (settings, state DB, globalStorage).
+	/[/\\]\.cline[/\\]data[/\\]/i,
+	/[/\\]cline[^/\\]*[/\\](?:settings|state|config)\.(?:json|db|ya?ml)$/i,
+	// VS Code globalStorage for the Cline extension.
+	/[/\\]globalStorage[/\\]saoudrizwan\./i,
+];
+
+function isSettingsPath(path: string): boolean {
+	return SETTINGS_FILE_PATTERNS.some((re) => re.test(path));
 }
 
 function branchHasChangelogChange(root: string): boolean {
@@ -441,7 +649,7 @@ const plugin: AgentPlugin = {
 		capabilities: ["hooks"],
 	},
 
-	setup(_api, ctx) {
+	setup(_api: unknown, ctx: SetupContext) {
 		workspaceRoot = ctx.workspaceInfo?.rootPath ?? process.cwd();
 	},
 
@@ -449,7 +657,10 @@ const plugin: AgentPlugin = {
 		// Inject a Plan-mode reminder when a run starts so the model knows not
 		// to attempt acting. This is advisory; the hard gate is YOLO/auto-approve
 		// being disabled in settings.
-		async runStart() {
+		// NOTE: this must be `beforeRun` — the AgentExtension hooks bag supports
+		// beforeRun/afterRun/beforeModel/afterModel/beforeTool/afterTool/onEvent
+		// only (`run_start` is a .cline/hooks file stage name, not a plugin hook).
+		async beforeRun(): Promise<undefined> {
 			console.error(
 				"[workflow-guard] run started — Plan mode is active; do not " +
 				"switch to Act mode or execute mutations without explicit " +
@@ -458,31 +669,59 @@ const plugin: AgentPlugin = {
 			return undefined;
 		},
 
-		async beforeTool({ toolCall, input }) {
-			// ── Policy 1: edits require an active task list ──────────────
-			// Exception: creating/updating the task list file itself.
+		async beforeTool({
+			toolCall,
+			input,
+		}: BeforeToolContext): Promise<HookResult | undefined> {
+			// ── Policies 1/7/9/10: edit tools (editor, apply_patch) ──────
 			if (EDIT_TOOL_NAMES.has(toolCall.toolName)) {
-				const record = asRecord(input);
-				const target =
-					typeof record?.path === "string"
-						? record.path
-						: typeof input === "string"
-							? input
-							: "";
-				const isTaskListEdit = TASK_LIST_FILES.some((name) =>
-					resolve(workspaceRoot, target).endsWith(name),
-				);
-				if (isTaskListEdit) {
-				const gate = taskCheckoffGate(workspaceRoot, input);
-				if (gate) return gate;
-			}
-			if (!isTaskListEdit && onProtectedBranch(workspaceRoot)) {
-				console.error(
-					`[workflow-guard] blocked ${toolCall.toolName}: on protected branch ${currentGitBranch(workspaceRoot)}`,
-				);
-				return { skip: true, reason: branchGuardReason() };
-			}
-			if (!isTaskListEdit && !findActiveTaskList(workspaceRoot)) {
+				const targets = editTargets(input);
+
+				// ── Policy 7: settings tamper via edit tools ──────────────
+				// (The shell-based tamper check cannot see these writes.)
+				for (const target of targets) {
+					if (isSettingsPath(resolve(workspaceRoot, target))) {
+						console.error(
+							`[workflow-guard] blocked settings file edit: ${target.slice(0, 120)}`,
+						);
+						return {
+							skip: true,
+							reason:
+								"Blocked: modifying Cline settings / auto-approve / YOLO " +
+								"configuration is not allowed from the agent. The user " +
+								"must change approval settings manually in the Cline UI.",
+						};
+					}
+				}
+
+				// Exact match against the known task-list files — a file merely
+				// *ending* in e.g. "TASKS.md" (docs/TASKS.md, NOT_TASKS.md) does
+				// not get the exemption.
+				const taskFile = targets
+					.map((t) => taskListNameForTarget(workspaceRoot, t))
+					.find((name) => name !== undefined);
+				const touchesOnlyTaskLists =
+					targets.length > 0 &&
+					targets.every(
+						(t) => taskListNameForTarget(workspaceRoot, t) !== undefined,
+					);
+
+				// ── Policy 10: commit-per-task + top-down check-off gate ──
+				if (taskFile) {
+					const gate = taskCheckoffGate(workspaceRoot, taskFile, input);
+					if (gate) return gate;
+				}
+
+				// ── Policy 9: no edits on protected branches ──────────────
+				if (!touchesOnlyTaskLists && onProtectedBranch(workspaceRoot)) {
+					console.error(
+						`[workflow-guard] blocked ${toolCall.toolName}: on protected branch ${currentGitBranch(workspaceRoot)}`,
+					);
+					return { skip: true, reason: branchGuardReason() };
+				}
+
+				// ── Policy 1: edits require an active task list ───────────
+				if (!touchesOnlyTaskLists && !findActiveTaskList(workspaceRoot)) {
 					console.error(
 						`[workflow-guard] blocked ${toolCall.toolName}: no active task list`,
 					);
